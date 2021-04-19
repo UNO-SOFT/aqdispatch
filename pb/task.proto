@@ -1,0 +1,16 @@
+// Copyright 2021 Tamás Gulácsi. All rights reserved.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+option go_package = "github.com/UNO-SOFT/aqdispatch/pb";
+import "google/protobuf/timestamp.proto";
+
+message Task {
+	string Func = 1;
+	string RefID = 2; 
+	string URL = 3;
+	google.protobuf.Timestamp Deadline = 4;
+	bytes Payload = 5;
+}
+
