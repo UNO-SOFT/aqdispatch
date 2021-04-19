@@ -58,7 +58,7 @@ func New(
 	outQName, outQType string,
 ) (*Dispatcher, error) {
 	if conf.AnswerKeyErrMsg == "" {
-		conf.AnswerKeyErrMsg = "HIBASZOV"
+		conf.AnswerKeyErrMsg = "ERRMSG"
 	}
 	if conf.AnswerKeyPayload == "" {
 		conf.AnswerKeyPayload = "PAYLOAD"
