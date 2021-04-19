@@ -1,4 +1,4 @@
-// Copyright 2021 Tamás Gulácsi. All rights reserved.
+// Copyright 2021 Tamás Guácsi. All rights reserved.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -51,7 +51,7 @@ type Config struct {
 type Task = pb.Task
 
 func New(
-	ctx context.Context, db *sql.DB,
+	db *sql.DB,
 	conf Config,
 	inQName, inQType string,
 	do func(context.Context, io.Writer, Task) error,
@@ -80,12 +80,18 @@ func New(
 		conf.DisQMaxFileSize = 16 << 20
 	}
 	if conf.DisQSyncEvery <= 0 {
-		conf.DisQSyncEvery = 1
+		conf.DisQSyncEvery = 1 << 10
 	}
 	if conf.DisQSyncTimeout <= 0 {
 		conf.DisQSyncTimeout = time.Second
 	}
 
+	if conf.Timeout <= 0 {
+		conf.Timeout = 30 * time.Second
+	}
+	if conf.PipeTimeout <= 0 {
+		conf.PipeTimeout = 0
+	}
 	if conf.Concurrency <= 0 {
 		conf.Concurrency = runtime.GOMAXPROCS(-1)
 	}
@@ -110,19 +116,23 @@ func New(
 		deqMsgs:    make([]godror.Message, conf.Concurrency),
 	}
 
-	cx, err := db.Conn(dbCtx(ctx, "aqdispatch", inQName))
+	ctx := context.Background()
+	getCx, err := db.Conn(dbCtx(ctx, "aqdispatch", inQName))
 	if err != nil {
+		di.Close()
 		return nil, err
 	}
-	defer cx.Close()
+	di.getCx = getCx
 
-	if err = godror.Raw(ctx, cx, func(conn godror.Conn) error {
+	if err = godror.Raw(ctx, getCx, func(conn godror.Conn) error {
 		di.Timezone = conn.Timezone()
 		return nil
 	}); err != nil {
+		di.Close()
 		return nil, err
 	}
-	if di.getQ, err = godror.NewQueue(ctx, cx, inQName, inQType); err != nil {
+	if di.getQ, err = godror.NewQueue(ctx, getCx, inQName, inQType); err != nil {
+		di.Close()
 		return nil, err
 	}
 	di.Log("msg", "getQ", "name", di.getQ.Name())
@@ -140,13 +150,13 @@ func New(
 		return nil, err
 	}
 
-	cx, err = db.Conn(dbCtx(ctx, "aqdispatch", outQName))
+	putCx, err := db.Conn(dbCtx(ctx, "aqdispatch", outQName))
 	if err != nil {
 		di.Close()
 		return nil, err
 	}
-	defer cx.Close()
-	if di.putQ, err = godror.NewQueue(ctx, cx, outQName, outQType); err != nil {
+	di.putCx = putCx
+	if di.putQ, err = godror.NewQueue(ctx, putCx, outQName, outQType); err != nil {
 		di.Close()
 		return nil, err
 	}
@@ -166,20 +176,20 @@ func New(
 
 // Dispatcher. After creating with New, start a Consumer for each task Func name!
 type Dispatcher struct {
-	conf Config
-	do   func(context.Context, io.Writer, Task) error
-	//db         *sql.DB
-	mu         sync.RWMutex
-	getQ       *godror.Queue
-	putQ       *godror.Queue
-	ins        map[string]chan Task
-	diskQs     map[string]diskqueue.Interface
-	gates      map[string]chan struct{}
-	datas      chan *godror.Data
-	putObjects chan *godror.Object
-	buffers    chan *bytes.Buffer
-	Timezone   *time.Location
-	deqMsgs    []godror.Message
+	conf         Config
+	do           func(context.Context, io.Writer, Task) error
+	getCx, putCx io.Closer
+	mu           sync.RWMutex
+	getQ         *godror.Queue
+	putQ         *godror.Queue
+	ins          map[string]chan Task
+	diskQs       map[string]diskqueue.Interface
+	gates        map[string]chan struct{}
+	datas        chan *godror.Data
+	putObjects   chan *godror.Object
+	buffers      chan *bytes.Buffer
+	Timezone     *time.Location
+	deqMsgs      []godror.Message
 }
 
 func (di *Dispatcher) Log(keyvals ...interface{}) error {
@@ -202,6 +212,8 @@ func (di *Dispatcher) Encode(s string) string {
 }
 
 func (di *Dispatcher) Close() error {
+	di.mu.Lock()
+	di.mu.Unlock()
 	ins, putO, diskQs := di.ins, di.putObjects, di.diskQs
 	di.ins, di.putObjects, di.diskQs = nil, nil, nil
 	for _, c := range ins {
@@ -219,6 +231,14 @@ func (di *Dispatcher) Close() error {
 		if q != nil {
 			q.Close()
 		}
+	}
+	getCx, putCx := di.getCx, di.putCx
+	di.getCx, di.putCx = nil, nil
+	if putCx != nil {
+		di.putCx.Close()
+	}
+	if getCx != nil {
+		di.getCx.Close()
 	}
 	return nil
 }
@@ -594,4 +614,16 @@ Loop:
 
 func dbCtx(ctx context.Context, module, action string) context.Context {
 	return godror.ContextWithTraceTag(ctx, godror.TraceTag{Module: module, Action: action})
+}
+
+type multiCloser []io.Closer
+
+func (mc multiCloser) Close() error {
+	var firstErr error
+	for i := len(mc) - 1; i >= 0; i-- {
+		if err := mc[i].Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
