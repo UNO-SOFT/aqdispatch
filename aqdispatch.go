@@ -260,7 +260,7 @@ var (
 
 	errContinue = errors.New("continue")
 )
-var taskPool = tskPool{pool: sync.Pool{New: func() interface{} { var t Task; return &t }}}
+var taskPool = tskPool{pool: &sync.Pool{New: func() interface{} { var t Task; return &t }}}
 
 func (di *Dispatcher) Batch(ctx context.Context) error {
 	select {
@@ -650,7 +650,7 @@ func dbCtx(ctx context.Context, module, action string) context.Context {
 }
 
 type tskPool struct {
-	pool sync.Pool
+	pool *sync.Pool
 }
 
 func (p tskPool) Acquire() *Task { return p.pool.Get().(*Task) }
