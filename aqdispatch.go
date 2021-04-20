@@ -41,27 +41,36 @@ type Config struct {
 	DisQMinMsgSize, DisQMaxMsgSize int32
 	DisQSyncTimeout                time.Duration
 
-	AnswerKeyErrMsg, AnswerKeyPayload string
+	RequestKeyName, RequestKeyPayload     string
+	ResponseKeyErrMsg, ResponseKeyPayload string
 
 	Timeout, PipeTimeout time.Duration
-	FuncCount            int
+	QueueCount           int
 	Concurrency          int
 }
 
 type Task = pb.Task
 
+// New returns a new Dispatcher, which receives inQType typed messages on inQName,
+// with Consume(nm) task.Name.
 func New(
 	db *sql.DB,
 	conf Config,
 	inQName, inQType string,
-	do func(context.Context, io.Writer, Task) error,
+	do func(context.Context, io.Writer, *Task) error,
 	outQName, outQType string,
 ) (*Dispatcher, error) {
-	if conf.AnswerKeyErrMsg == "" {
-		conf.AnswerKeyErrMsg = "ERRMSG"
+	if conf.RequestKeyName == "" {
+		conf.RequestKeyName = "NAME"
 	}
-	if conf.AnswerKeyPayload == "" {
-		conf.AnswerKeyPayload = "PAYLOAD"
+	if conf.RequestKeyPayload == "" {
+		conf.RequestKeyPayload = "PAYLOAD"
+	}
+	if conf.ResponseKeyErrMsg == "" {
+		conf.ResponseKeyErrMsg = "ERRMSG"
+	}
+	if conf.ResponseKeyPayload == "" {
+		conf.ResponseKeyPayload = "PAYLOAD"
 	}
 	if conf.DisQPrefix == "" {
 		conf.DisQPrefix = "aqdispatch-"
@@ -107,9 +116,9 @@ func New(
 	di := Dispatcher{
 		conf:       conf,
 		do:         do,
-		ins:        make(map[string]chan Task, conf.FuncCount),
-		diskQs:     make(map[string]diskqueue.Interface, conf.FuncCount),
-		gates:      make(map[string]chan struct{}, conf.FuncCount),
+		ins:        make(map[string]chan *Task, conf.QueueCount),
+		diskQs:     make(map[string]diskqueue.Interface, conf.QueueCount),
+		gates:      make(map[string]chan struct{}, conf.QueueCount),
 		putObjects: make(chan *godror.Object, conf.Concurrency),
 		datas:      make(chan *godror.Data, conf.Concurrency),
 		buffers:    make(chan *bytes.Buffer, conf.Concurrency),
@@ -177,12 +186,12 @@ func New(
 // Dispatcher. After creating with New, start a Consumer for each task Func name!
 type Dispatcher struct {
 	conf         Config
-	do           func(context.Context, io.Writer, Task) error
+	do           func(context.Context, io.Writer, *Task) error
 	getCx, putCx io.Closer
 	mu           sync.RWMutex
 	getQ         *godror.Queue
 	putQ         *godror.Queue
-	ins          map[string]chan Task
+	ins          map[string]chan *Task
 	diskQs       map[string]diskqueue.Interface
 	gates        map[string]chan struct{}
 	datas        chan *godror.Data
@@ -213,7 +222,7 @@ func (di *Dispatcher) Encode(s string) string {
 
 func (di *Dispatcher) Close() error {
 	di.mu.Lock()
-	di.mu.Unlock()
+	defer di.mu.Unlock()
 	ins, putO, diskQs := di.ins, di.putObjects, di.diskQs
 	di.ins, di.putObjects, di.diskQs = nil, nil, nil
 	for _, c := range ins {
@@ -249,6 +258,7 @@ var (
 	ErrEmpty          = errors.New("empty")
 	ErrExit           = errors.New("exit")
 )
+var taskPool = sync.Pool{New: func() interface{} { var t Task; return &t }}
 
 func (di *Dispatcher) Batch(ctx context.Context) error {
 	select {
@@ -271,9 +281,10 @@ func (di *Dispatcher) Batch(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, di.conf.Timeout)
 	defer cancel()
 	for i := range di.deqMsgs[:n] {
+		task := taskPool.Get().(*Task)
 		// The messages are tightly coupled with the queue,
 		// so we must parse them sequentially.
-		task, err := di.parse(ctx, &di.deqMsgs[i])
+		err = di.parse(ctx, task, &di.deqMsgs[i])
 		if err != nil {
 			if errors.Is(err, ErrEmpty) {
 				continue
@@ -285,7 +296,7 @@ func (di *Dispatcher) Batch(ctx context.Context) error {
 		}
 
 		di.mu.RLock()
-		inCh, ok := di.ins[task.Func]
+		inCh, ok := di.ins[task.Name]
 		di.mu.RUnlock()
 		if !ok {
 			if firstErr == nil {
@@ -300,13 +311,13 @@ func (di *Dispatcher) Batch(ctx context.Context) error {
 		// Skip the disk queue
 		default:
 			// diskQs are for traffic jams
-			b, err := proto.Marshal(&task)
+			b, err := proto.Marshal(task)
 			if err != nil {
 				return err
 			}
-			di.Log("msg", "enqueue", "task", task.Func, "deadline", task.Deadline)
+			di.Log("msg", "enqueue", "task", task.Name, "deadline", task.Deadline)
 			di.mu.RLock()
-			q, ok := di.diskQs[task.Func]
+			q, ok := di.diskQs[task.Name]
 			di.mu.RUnlock()
 			if !ok {
 				if firstErr == nil {
@@ -315,8 +326,8 @@ func (di *Dispatcher) Batch(ctx context.Context) error {
 				continue
 			}
 			if err = q.Put(b); err != nil {
-				di.Log("msg", "enqueue", "queue", task.Func, "error", err)
-				return fmt.Errorf("put slurpus task into %q queue: %w", task.Func, err)
+				di.Log("msg", "enqueue", "queue", task.Name, "error", err)
+				return fmt.Errorf("put slurpus task into %q queue: %w", task.Name, err)
 			}
 		}
 	}
@@ -334,7 +345,7 @@ func (di *Dispatcher) Consume(ctx context.Context, nm string) error {
 		di.mu.Lock()
 		inCh, gate, q = di.ins[nm], di.gates[nm], di.diskQs[nm]
 		if inCh == nil {
-			inCh = make(chan Task)
+			inCh = make(chan *Task)
 			di.ins[nm] = inCh
 		}
 		if gate == nil {
@@ -354,6 +365,7 @@ func (di *Dispatcher) Consume(ctx context.Context, nm string) error {
 				})
 			if q.Depth() == 0 {
 				if err := q.Empty(); err != nil {
+					di.mu.Unlock()
 					return fmt.Errorf("empty %q: %w", nm, err)
 				}
 			}
@@ -362,26 +374,31 @@ func (di *Dispatcher) Consume(ctx context.Context, nm string) error {
 		di.mu.Unlock()
 	}
 
-	var token struct{}
-Loop:
-	for {
-		var task Task
+	one := func(ctx context.Context) error {
+		var token struct{}
+		task := taskPool.Get().(*Task)
+		defer func() {
+			if task != nil {
+				*task = Task{}
+				taskPool.Put(task)
+			}
+		}()
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case task = <-inCh:
 			// fast path
 		case b := <-q.ReadChan():
-			if err := proto.Unmarshal(b, &task); err != nil {
+			if err := proto.Unmarshal(b, task); err != nil {
 				di.Log("msg", "unmarshal", "bytes", b, "error", err)
-				continue Loop
+				return nil
 			}
 		}
 
 		if !task.GetDeadline().AsTime().After(time.Now()) {
 			di.Log("msg", "skip overtime", "deadline", task.Deadline)
 			_ = di.answer(task.RefID, nil, context.DeadlineExceeded)
-			continue
+			return nil
 		}
 		select {
 		case <-ctx.Done():
@@ -390,15 +407,21 @@ Loop:
 			// Execution can go on a separate goroutine.
 			go func() {
 				defer func() { <-gate }()
-				di.Log("msg", "execute queued", "task", task.Func, "deadline", task.Deadline)
+				di.Log("msg", "execute queued", "task", task.Name, "deadline", task.Deadline)
 				di.execute(ctx, task)
 			}()
 		}
+		return nil
 	}
-	return nil
+
+	for {
+		if err := one(ctx); err != nil {
+			return err
+		}
+	}
 }
 
-func (di *Dispatcher) parse(ctx context.Context, msg *godror.Message) (task Task, err error) {
+func (di *Dispatcher) parse(ctx context.Context, task *Task, msg *godror.Message) error {
 	if msg != nil && msg.Object != nil {
 		defer func() {
 			if msg != nil && msg.Object != nil {
@@ -408,7 +431,7 @@ func (di *Dispatcher) parse(ctx context.Context, msg *godror.Message) (task Task
 	}
 	select {
 	case <-ctx.Done():
-		return task, ctx.Err()
+		return ctx.Err()
 	default:
 	}
 	var data *godror.Data
@@ -443,41 +466,34 @@ func (di *Dispatcher) parse(ctx context.Context, msg *godror.Message) (task Task
 	if debug != nil {
 		debug.Log("msg", msg, "obj", obj)
 	}
-	if err = obj.GetAttribute(data, "URL"); err != nil {
-		return task, fmt.Errorf("get URL: %w", err)
+	if err := obj.GetAttribute(data, di.conf.RequestKeyName); err != nil {
+		return fmt.Errorf("get %s: %w", di.conf.RequestKeyName, err)
 	}
-	task.URL = string(data.GetBytes())
+	task.Name = string(data.GetBytes())
 	if debug != nil {
-		debug.Log("msg", "get url", "data", data, "url", task.URL)
-	}
-	if err = obj.GetAttribute(data, "FUNC"); err != nil {
-		return task, fmt.Errorf("get FUNC: %w", err)
-	}
-	task.Func = string(data.GetBytes())
-	if debug != nil {
-		debug.Log("msg", "get func", "data", data, "func", task.Func)
+		debug.Log("msg", "get task name", "data", data, "name", task.Name)
 	}
 
-	if err = obj.GetAttribute(data, "PAYLOAD"); err != nil {
-		return task, fmt.Errorf("get PAYLOAD: %w", err)
+	if err := obj.GetAttribute(data, di.conf.RequestKeyPayload); err != nil {
+		return fmt.Errorf("get %s: %w", di.conf.RequestKeyPayload, err)
 	}
 	if debug != nil {
 		debug.Log("msg", "get payload", "data", data)
 	}
-	task.Payload, err = ioutil.ReadAll(data.GetLob())
-	if err != nil {
-		return task, fmt.Errorf("getLOB: %w", err)
+	var err error
+	if task.Payload, err = ioutil.ReadAll(data.GetLob()); err != nil {
+		return fmt.Errorf("getLOB: %w", err)
 	}
-	logger.Log("msg", "parse", "url", task.URL, "func", task.Func, "payloadLen", len(task.Payload), "enqueued", msg.Enqueued, "delay", msg.Delay, "expiry", msg.Expiration, "deadline", task.Deadline)
-	if task.RefID == "" || task.URL == "" || task.Func == "" {
-		return task, ErrEmpty
+	logger.Log("msg", "parse", "name", task.Name, "payloadLen", len(task.Payload), "enqueued", msg.Enqueued, "delay", msg.Delay, "expiry", msg.Expiration, "deadline", task.Deadline)
+	if task.RefID == "" || task.Name == "" {
+		return ErrEmpty
 	}
 
-	return task, nil
+	return nil
 }
 
-func (di *Dispatcher) execute(ctx context.Context, task Task) error {
-	if task.RefID == "" || task.URL == "" || task.Func == "" {
+func (di *Dispatcher) execute(ctx context.Context, task *Task) error {
+	if task.RefID == "" || task.Name == "" {
 		return ErrEmpty
 	}
 
@@ -491,13 +507,13 @@ func (di *Dispatcher) execute(ctx context.Context, task Task) error {
 		ctx, cancel = context.WithDeadline(ctx, task.Deadline.AsTime())
 		defer cancel()
 	}
-	logger.Log("msg", "execute", "func", task.Func, "url", task.URL, "payloadLen", len(task.Payload), "deadline", task.Deadline.AsTime().In(time.Local))
+	logger.Log("msg", "execute", "name", task.Name, "payloadLen", len(task.Payload), "deadline", task.Deadline.AsTime().In(time.Local))
 	if debug != nil {
 		debug.Log("msg", "execute", "payload", string(task.Payload))
 	}
 	/*
 		if di.Tracer != nil {
-			tCtx, span := di.Tracer.Start(ctx, "task="+task.Func)
+			tCtx, span := di.Tracer.Start(ctx, "task="+task.Name)
 			ctx = tCtx
 			defer span.End()
 		}
@@ -584,15 +600,15 @@ Loop:
 		}
 	}
 	if errMsg != "" {
-		if err = obj.Set(di.conf.AnswerKeyErrMsg, errMsg); err != nil {
+		if err = obj.Set(di.conf.ResponseKeyErrMsg, errMsg); err != nil {
 			obj.Close()
-			return fmt.Errorf("set %s: %w", di.conf.AnswerKeyErrMsg, err)
+			return fmt.Errorf("set %s: %w", di.conf.ResponseKeyErrMsg, err)
 		}
 	}
 	if len(payload) != 0 {
-		if err = obj.Set(di.conf.AnswerKeyPayload, payload); err != nil {
+		if err = obj.Set(di.conf.ResponseKeyPayload, payload); err != nil {
 			obj.Close()
-			return fmt.Errorf("set %s: %w", di.conf.AnswerKeyPayload, err)
+			return fmt.Errorf("set %s: %w", di.conf.ResponseKeyPayload, err)
 		}
 	}
 	msg := godror.Message{
@@ -614,16 +630,4 @@ Loop:
 
 func dbCtx(ctx context.Context, module, action string) context.Context {
 	return godror.ContextWithTraceTag(ctx, godror.TraceTag{Module: module, Action: action})
-}
-
-type multiCloser []io.Closer
-
-func (mc multiCloser) Close() error {
-	var firstErr error
-	for i := len(mc) - 1; i >= 0; i-- {
-		if err := mc[i].Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
 }

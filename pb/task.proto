@@ -7,9 +7,9 @@ option go_package = "github.com/UNO-SOFT/aqdispatch/pb";
 import "google/protobuf/timestamp.proto";
 
 message Task {
-	string Func = 1;
+	string Name = 1;
 	string RefID = 2; 
-	string URL = 3;
+    reserved 3;  // Was: url
 	google.protobuf.Timestamp Deadline = 4;
 	bytes Payload = 5;
 }
