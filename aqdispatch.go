@@ -257,8 +257,10 @@ var (
 	ErrSkipResponse   = errors.New("skip response")
 	ErrEmpty          = errors.New("empty")
 	ErrExit           = errors.New("exit")
+
+	errContinue = errors.New("continue")
 )
-var taskPool = sync.Pool{New: func() interface{} { var t Task; return &t }}
+var taskPool = tskPool{pool: sync.Pool{New: func() interface{} { var t Task; return &t }}}
 
 func (di *Dispatcher) Batch(ctx context.Context) error {
 	select {
@@ -278,21 +280,18 @@ func (di *Dispatcher) Batch(ctx context.Context) error {
 	}
 
 	var firstErr error
-	ctx, cancel := context.WithTimeout(ctx, di.conf.Timeout)
-	defer cancel()
-	for i := range di.deqMsgs[:n] {
-		task := taskPool.Get().(*Task)
+	one := func(ctx context.Context, task *Task, msg *godror.Message) error {
 		// The messages are tightly coupled with the queue,
 		// so we must parse them sequentially.
-		err = di.parse(ctx, task, &di.deqMsgs[i])
+		err = di.parse(ctx, task, msg)
 		if err != nil {
 			if errors.Is(err, ErrEmpty) {
-				continue
+				return errContinue
 			}
 			if firstErr == nil {
 				firstErr = err
 			}
-			continue
+			return errContinue
 		}
 
 		di.mu.RLock()
@@ -302,7 +301,7 @@ func (di *Dispatcher) Batch(ctx context.Context) error {
 			if firstErr == nil {
 				firstErr = ErrUnknownCommand
 			}
-			continue
+			return errContinue
 		}
 		select {
 		case <-ctx.Done():
@@ -323,11 +322,25 @@ func (di *Dispatcher) Batch(ctx context.Context) error {
 				if firstErr == nil {
 					firstErr = ErrUnknownCommand
 				}
-				continue
+				return errContinue
 			}
 			if err = q.Put(b); err != nil {
 				di.Log("msg", "enqueue", "queue", task.Name, "error", err)
-				return fmt.Errorf("put slurpus task into %q queue: %w", task.Name, err)
+				return fmt.Errorf("put surplus task into %q queue: %w", task.Name, err)
+			}
+			return errContinue // release Task
+		}
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, di.conf.Timeout)
+	defer cancel()
+	for i := range di.deqMsgs[:n] {
+		task := taskPool.Acquire()
+		if err := one(ctx, task, &di.deqMsgs[i]); err != nil {
+			taskPool.Release(task)
+			if !errors.Is(err, errContinue) {
+				return err
 			}
 		}
 	}
@@ -376,28 +389,31 @@ func (di *Dispatcher) Consume(ctx context.Context, nm string) error {
 
 	one := func(ctx context.Context) error {
 		var token struct{}
-		task := taskPool.Get().(*Task)
-		defer func() {
-			if task != nil {
-				*task = Task{}
-				taskPool.Put(task)
-			}
-		}()
+		task := taskPool.Acquire()
 		select {
 		case <-ctx.Done():
+			taskPool.Release(task)
 			return ctx.Err()
 		case task = <-inCh:
 			// fast path
 		case b := <-q.ReadChan():
 			if err := proto.Unmarshal(b, task); err != nil {
 				di.Log("msg", "unmarshal", "bytes", b, "error", err)
+				taskPool.Release(task)
 				return nil
 			}
 		}
-
+		if task.Name == "" {
+			di.Log("msg", "empty task", "task", task)
+			taskPool.Release(task)
+			return nil
+		}
 		if !task.GetDeadline().AsTime().After(time.Now()) {
-			di.Log("msg", "skip overtime", "deadline", task.Deadline)
-			_ = di.answer(task.RefID, nil, context.DeadlineExceeded)
+			di.Log("msg", "skip overtime", "deadline", task.Deadline, "refID", task.RefID)
+			if task.RefID != "" {
+				_ = di.answer(task.RefID, nil, context.DeadlineExceeded)
+			}
+			taskPool.Release(task)
 			return nil
 		}
 		select {
@@ -407,8 +423,9 @@ func (di *Dispatcher) Consume(ctx context.Context, nm string) error {
 			// Execution can go on a separate goroutine.
 			go func() {
 				defer func() { <-gate }()
-				di.Log("msg", "execute queued", "task", task.Name, "deadline", task.Deadline)
+				di.Log("msg", "execute queued", "task", task.Name, "deadline", task.Deadline, "payloadLen", len(task.Payload))
 				di.execute(ctx, task)
+				taskPool.Release(task)
 			}()
 		}
 		return nil
@@ -630,4 +647,16 @@ Loop:
 
 func dbCtx(ctx context.Context, module, action string) context.Context {
 	return godror.ContextWithTraceTag(ctx, godror.TraceTag{Module: module, Action: action})
+}
+
+type tskPool struct {
+	pool sync.Pool
+}
+
+func (p tskPool) Acquire() *Task { return p.pool.Get().(*Task) }
+func (p tskPool) Release(t *Task) {
+	if t != nil {
+		*t = Task{}
+		p.pool.Put(t)
+	}
 }
