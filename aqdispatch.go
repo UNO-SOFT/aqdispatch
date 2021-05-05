@@ -70,6 +70,8 @@ type Task = pb.Task
 //
 // Then it calls "do" function with the task, and sends its output as response
 // on outQName queue in outQType message.
+//
+// When outQNameand outQType is empty, no response is sent, no response queue is opened.
 func New(
 	db *sql.DB,
 	conf Config,
@@ -127,19 +129,21 @@ func New(
 	if do == nil {
 		return nil, errors.New("do function cannot be nil")
 	}
-	if inQName == "" || outQName == "" || inQType == "" || outQType == "" {
-		return nil, errors.New("inQName, inQType and outQName, outQType are required")
+	if inQName == "" || inQType == "" {
+		return nil, errors.New("inQName, inQType are required")
+	}
+	if outQName != "" && outQType == "" || outQName == "" && outQType != "" {
+		return nil, errors.New("outQName, outQType are required")
 	}
 	di := Dispatcher{
-		conf:       conf,
-		do:         do,
-		ins:        make(map[string]chan *Task, conf.QueueCount),
-		diskQs:     make(map[string]diskqueue.Interface, conf.QueueCount),
-		gates:      make(map[string]chan struct{}, conf.QueueCount),
-		putObjects: make(chan *godror.Object, conf.Concurrency),
-		datas:      make(chan *godror.Data, conf.Concurrency),
-		buffers:    make(chan *bytes.Buffer, conf.Concurrency),
-		deqMsgs:    make([]godror.Message, conf.Concurrency),
+		conf:    conf,
+		do:      do,
+		ins:     make(map[string]chan *Task, conf.QueueCount),
+		diskQs:  make(map[string]diskqueue.Interface, conf.QueueCount),
+		gates:   make(map[string]chan struct{}, conf.QueueCount),
+		datas:   make(chan *godror.Data, conf.Concurrency),
+		buffers: make(chan *bytes.Buffer, conf.Concurrency),
+		deqMsgs: make([]godror.Message, conf.Concurrency),
 	}
 
 	ctx := context.Background()
@@ -176,6 +180,11 @@ func New(
 		return nil, err
 	}
 
+	if outQName == "" {
+		return &di, nil
+	}
+
+	di.putObjects = make(chan *godror.Object, conf.Concurrency)
 	putCx, err := db.Conn(dbCtx(ctx, "aqdispatch", outQName))
 	if err != nil {
 		di.Close()
@@ -248,8 +257,8 @@ func (di *Dispatcher) Encode(s string) string {
 func (di *Dispatcher) Close() error {
 	di.mu.Lock()
 	defer di.mu.Unlock()
-	ins, putO, diskQs := di.ins, di.putObjects, di.diskQs
-	di.ins, di.putObjects, di.diskQs = nil, nil, nil
+	ins, putO, diskQs, getQ, putQ := di.ins, di.putObjects, di.diskQs, di.getQ, di.putQ
+	di.ins, di.putObjects, di.diskQs, di.getQ, di.putQ = nil, nil, nil, nil, nil
 	for _, c := range ins {
 		close(c)
 	}
@@ -273,6 +282,12 @@ func (di *Dispatcher) Close() error {
 	}
 	if getCx != nil {
 		di.getCx.Close()
+	}
+	if getQ != nil {
+		getQ.Close()
+	}
+	if putQ != nil {
+		putQ.Close()
 	}
 	return nil
 }
@@ -594,7 +609,7 @@ func (di *Dispatcher) execute(ctx context.Context, task *Task) error {
 	start := time.Now()
 	callErr := di.do(ctx, res, task)
 	logger.Log("msg", "call", "dur", time.Since(start), "error", callErr)
-	if callErr == ErrExit {
+	if callErr == ErrExit || di.putQ == nil {
 		return callErr
 	}
 	start = time.Now()
@@ -605,6 +620,9 @@ func (di *Dispatcher) execute(ctx context.Context, task *Task) error {
 
 // answer puts the answer into the queue.
 func (di *Dispatcher) answer(refID string, payload []byte, err error) error {
+	if di.putQ == nil {
+		return nil
+	}
 	var errMsg string
 	if err != nil {
 		if errors.Is(err, ErrSkipResponse) {
