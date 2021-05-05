@@ -29,30 +29,47 @@ import (
 //go:generate go get google.golang.org/protobuf/cmd/protoc-gen-go
 //go:generate protoc --proto_path=pb --go_out=pb -I../../../ --go_opt=paths=source_relative pb/task.proto
 
+// Config of the Dispatcher.
 type Config struct {
 	log.Logger
 	Debug log.Logger
 	//Tracer:     tracer,
 
+	// Enc is needed when DB sends/requires something other than UTF-8
 	Enc encoding.Encoding
 
-	DisQPrefix, DisQPath           string
+	// DisQPrefix is the diskqueue file's prefix.
+	DisQPrefix string
+	// DisQPath is the path for the diskqueue.
+	DisQPath                       string
 	DisQMaxFileSize, DisQSyncEvery int64
 	DisQMinMsgSize, DisQMaxMsgSize int32
 	DisQSyncTimeout                time.Duration
 
-	RequestKeyName, RequestKeyPayload     string
-	ResponseKeyErrMsg, ResponseKeyPayload string
+	// RequestKeyName is the attribute name instead of NAME.
+	RequestKeyName string
+	// RequestKeyPayload is the attribute name instead of PAYLOAD
+	RequestKeyPayload string
+	// ResponseKeyErrMsg is the attribute name instead of ERRMSG
+	ResponseKeyErrMsg string
+	// ResponseKeyPayload is the attribute name instead of PAYLOAD
+	ResponseKeyPayload string
 
 	Timeout, PipeTimeout time.Duration
-	QueueCount           int
-	Concurrency          int
+	// QueueCount is the approximate number of queues dispatched over this AQ.
+	QueueCount int
+	// Concurrency is the number of concurrent RPCs.
+	Concurrency int
 }
 
+// Task is a task.
 type Task = pb.Task
 
 // New returns a new Dispatcher, which receives inQType typed messages on inQName,
 // with Consume(nm) task.Name.
+//
+// Then it calls "do" function with the task, and sends its output as response
+// on outQName queue in outQType message.
 func New(
 	db *sql.DB,
 	conf Config,
@@ -184,6 +201,10 @@ func New(
 }
 
 // Dispatcher. After creating with New, start a Consumer for each task Func name!
+//
+// Reads tasks and store the messages in diskqueues - one for each distinct NAME.
+// If Concurrency allows, calls the do function given in New,
+// and sends the answer as PAYLOAD of what that writes as response.
 type Dispatcher struct {
 	conf         Config
 	do           func(context.Context, io.Writer, *Task) error
@@ -205,6 +226,7 @@ func (di *Dispatcher) Log(keyvals ...interface{}) error {
 	return di.conf.Logger.Log(keyvals...)
 }
 
+// Decode the string from DB's encoding to UTF-8.
 func (di *Dispatcher) Decode(p []byte) string {
 	if di.conf.Enc == nil {
 		return string(p)
@@ -212,6 +234,8 @@ func (di *Dispatcher) Decode(p []byte) string {
 	q, _ := di.conf.Enc.NewDecoder().Bytes(p)
 	return string(q)
 }
+
+// Encode a string using the DB's encoding.
 func (di *Dispatcher) Encode(s string) string {
 	if di.conf.Enc == nil {
 		return s
@@ -220,6 +244,7 @@ func (di *Dispatcher) Encode(s string) string {
 	return s
 }
 
+// Close the dispatcher.
 func (di *Dispatcher) Close() error {
 	di.mu.Lock()
 	defer di.mu.Unlock()
@@ -262,6 +287,9 @@ var (
 )
 var taskPool = tskPool{pool: &sync.Pool{New: func() interface{} { var t Task; return &t }}}
 
+// Batch process at most Config.Concurrency number of messages: wait at max Config.Timeout,
+// then for each message, decode it, send to the named channel if possible,
+// otherwise save it to a specific diskqueue.
 func (di *Dispatcher) Batch(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
@@ -350,6 +378,9 @@ func (di *Dispatcher) Batch(ctx context.Context) error {
 // Consume the named queue. Does not return.
 //
 // MUST be started for each function name!
+//
+// First it processes the diskqueue (old, saved messages),
+// then waits on the "nm" named channel for tasks.
 func (di *Dispatcher) Consume(ctx context.Context, nm string) error {
 	di.mu.RLock()
 	inCh, gate, q := di.ins[nm], di.gates[nm], di.diskQs[nm]
@@ -438,6 +469,7 @@ func (di *Dispatcher) Consume(ctx context.Context, nm string) error {
 	}
 }
 
+// parse a *godror.Message from the queue into a Task.
 func (di *Dispatcher) parse(ctx context.Context, task *Task, msg *godror.Message) error {
 	if msg != nil && msg.Object != nil {
 		defer func() {
@@ -509,6 +541,7 @@ func (di *Dispatcher) parse(ctx context.Context, task *Task, msg *godror.Message
 	return nil
 }
 
+// execute calls do on the task, then calls answer with the answer.
 func (di *Dispatcher) execute(ctx context.Context, task *Task) error {
 	if task.RefID == "" || task.Name == "" {
 		return ErrEmpty
@@ -570,6 +603,7 @@ func (di *Dispatcher) execute(ctx context.Context, task *Task) error {
 	return err
 }
 
+// answer puts the answer into the queue.
 func (di *Dispatcher) answer(refID string, payload []byte, err error) error {
 	var errMsg string
 	if err != nil {
