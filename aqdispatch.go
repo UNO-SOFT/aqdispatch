@@ -337,8 +337,14 @@ func (di *Dispatcher) Batch(ctx context.Context) error {
 			return errContinue
 		}
 
+		nm := task.Name
 		di.mu.RLock()
-		inCh, ok := di.ins[task.Name]
+		inCh, ok := di.ins[nm]
+		if !ok {
+			if inCh, ok = di.ins[""]; ok {
+				nm = ""
+			}
+		}
 		di.mu.RUnlock()
 		if !ok {
 			if firstErr == nil {
@@ -359,7 +365,7 @@ func (di *Dispatcher) Batch(ctx context.Context) error {
 			}
 			di.Log("msg", "enqueue", "task", task.Name, "deadline", task.Deadline)
 			di.mu.RLock()
-			q, ok := di.diskQs[task.Name]
+			q, ok := di.diskQs[nm]
 			di.mu.RUnlock()
 			if !ok {
 				if firstErr == nil {
@@ -396,6 +402,8 @@ func (di *Dispatcher) Batch(ctx context.Context) error {
 //
 // First it processes the diskqueue (old, saved messages),
 // then waits on the "nm" named channel for tasks.
+//
+// When nm is the empty string, that's a catch-all (not catched by others).
 func (di *Dispatcher) Consume(ctx context.Context, nm string) error {
 	di.mu.RLock()
 	inCh, gate, q := di.ins[nm], di.gates[nm], di.diskQs[nm]
