@@ -17,13 +17,17 @@ import (
 	"sync"
 	"time"
 
-	"github.com/UNO-SOFT/aqdispatch/pb"
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/text/encoding"
+
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
 	"github.com/go-kit/kit/log"
 	"github.com/godror/godror"
 	"github.com/nsqio/go-diskqueue"
-	"golang.org/x/text/encoding"
-	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/types/known/timestamppb"
+
+	"github.com/UNO-SOFT/aqdispatch/pb"
 )
 
 //go:generate go get google.golang.org/protobuf/cmd/protoc-gen-go
@@ -65,8 +69,7 @@ type Config struct {
 // Task is a task.
 type Task = pb.Task
 
-// New returns a new Dispatcher, which receives inQType typed messages on inQName,
-// with Consume(nm) task.Name.
+// New returns a new Dispatcher, which receives inQType typed messages on inQName.
 //
 // Then it calls "do" function with the task, and sends its output as response
 // on outQName queue in outQType message.
@@ -118,10 +121,13 @@ func New(
 		conf.Timeout = 30 * time.Second
 	}
 	if conf.PipeTimeout <= 0 {
-		conf.PipeTimeout = 0
+		conf.PipeTimeout = 30 * time.Second
 	}
 	if conf.Concurrency <= 0 {
 		conf.Concurrency = runtime.GOMAXPROCS(-1)
+	}
+	if conf.QueueCount <= 0 {
+		conf.QueueCount = 1
 	}
 	if conf.Logger == nil {
 		conf.Logger = log.NewNopLogger()
@@ -209,7 +215,27 @@ func New(
 	return &di, nil
 }
 
-// Dispatcher. After creating with New, start a Consumer for each task Func name!
+// Run the dispatcher, accepting tasks with names in taskNames.
+func (di *Dispatcher) Run(ctx context.Context, taskNames []string) error {
+	grp, ctx := errgroup.WithContext(ctx)
+	for _, nm := range taskNames {
+		nm := nm
+		grp.Go(func() error { return di.consume(ctx, nm) })
+	}
+	if di.conf.Debug != nil {
+		di.conf.Debug.Log("msg", "prepared consumers", "taskNames", taskNames)
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := di.batch(ctx); err != nil {
+			di.Log("msg", "batch finished", "error", err)
+		}
+	}
+}
+
+// Dispatcher. After creating with New, run it with Run.
 //
 // Reads tasks and store the messages in diskqueues - one for each distinct NAME.
 // If Concurrency allows, calls the do function given in New,
@@ -278,10 +304,10 @@ func (di *Dispatcher) Close() error {
 	getCx, putCx := di.getCx, di.putCx
 	di.getCx, di.putCx = nil, nil
 	if putCx != nil {
-		di.putCx.Close()
+		putCx.Close()
 	}
 	if getCx != nil {
-		di.getCx.Close()
+		getCx.Close()
 	}
 	if getQ != nil {
 		getQ.Close()
@@ -298,20 +324,24 @@ var (
 	ErrEmpty          = errors.New("empty")
 	ErrExit           = errors.New("exit")
 
-	errContinue = errors.New("continue")
+	errChannelClosed = errors.New("channel is closed")
+	errContinue      = errors.New("continue")
 )
 var taskPool = tskPool{pool: &sync.Pool{New: func() interface{} { var t Task; return &t }}}
 
-// Batch process at most Config.Concurrency number of messages: wait at max Config.Timeout,
+// batch process at most Config.Concurrency number of messages: wait at max Config.Timeout,
 // then for each message, decode it, send to the named channel if possible,
 // otherwise save it to a specific diskqueue.
-func (di *Dispatcher) Batch(ctx context.Context) error {
+func (di *Dispatcher) batch(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
 	}
 	n, err := di.getQ.Dequeue(di.deqMsgs[:])
+	if di.conf.Debug != nil {
+		di.conf.Debug.Log("msg", "dequeue", "n", n, "error", err)
+	}
 	if n > 0 || err != nil {
 		di.Log("msg", "dequeue", "n", n, "error", err)
 	}
@@ -341,6 +371,9 @@ func (di *Dispatcher) Batch(ctx context.Context) error {
 		di.mu.RLock()
 		inCh, ok := di.ins[nm]
 		if !ok {
+			if di.conf.Debug != nil {
+				di.conf.Debug.Log("msg", "unknown task", "name", nm)
+			}
 			if inCh, ok = di.ins[""]; ok {
 				nm = ""
 			}
@@ -356,7 +389,7 @@ func (di *Dispatcher) Batch(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case inCh <- task:
-		// Skip the disk queue
+			// Skip the disk queue
 		default:
 			// diskQs are for traffic jams
 			b, err := proto.Marshal(task)
@@ -388,6 +421,9 @@ func (di *Dispatcher) Batch(ctx context.Context) error {
 		task := taskPool.Acquire()
 		if err := one(ctx, task, &di.deqMsgs[i]); err != nil {
 			taskPool.Release(task)
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil
+			}
 			if !errors.Is(err, errContinue) {
 				return err
 			}
@@ -396,7 +432,7 @@ func (di *Dispatcher) Batch(ctx context.Context) error {
 	return firstErr
 }
 
-// Consume the named queue. Does not return.
+// consume the named queue. Does not return.
 //
 // MUST be started for each function name!
 //
@@ -404,7 +440,10 @@ func (di *Dispatcher) Batch(ctx context.Context) error {
 // then waits on the "nm" named channel for tasks.
 //
 // When nm is the empty string, that's a catch-all (not catched by others).
-func (di *Dispatcher) Consume(ctx context.Context, nm string) error {
+func (di *Dispatcher) consume(ctx context.Context, nm string) error {
+	if di.conf.Debug != nil {
+		di.conf.Debug.Log("msg", "consume", "name", nm)
+	}
 	di.mu.RLock()
 	inCh, gate, q := di.ins[nm], di.gates[nm], di.diskQs[nm]
 	di.mu.RUnlock()
@@ -441,26 +480,36 @@ func (di *Dispatcher) Consume(ctx context.Context, nm string) error {
 		di.mu.Unlock()
 	}
 
-	one := func(ctx context.Context) error {
-		var token struct{}
-		task := taskPool.Acquire()
+	one := func(task *Task) error {
+		var ok bool
 		select {
 		case <-ctx.Done():
-			taskPool.Release(task)
 			return ctx.Err()
-		case task = <-inCh:
+		case task, ok = <-inCh:
+			if !ok {
+				return fmt.Errorf("%q: %w", nm, errChannelClosed)
+			}
 			// fast path
-		case b := <-q.ReadChan():
+		case b, ok := <-q.ReadChan():
+			if !ok {
+				return nil
+			}
 			if err := proto.Unmarshal(b, task); err != nil {
 				di.Log("msg", "unmarshal", "bytes", b, "error", err)
 				taskPool.Release(task)
-				return nil
+				return errContinue
 			}
+		}
+		if di.conf.Debug != nil {
+			di.conf.Debug.Log("msg", "consume", "task", task)
+		}
+		if task == nil {
+			return errContinue
 		}
 		if task.Name == "" {
 			di.Log("msg", "empty task", "task", task)
 			taskPool.Release(task)
-			return nil
+			return errContinue
 		}
 		if !task.GetDeadline().AsTime().After(time.Now()) {
 			di.Log("msg", "skip overtime", "deadline", task.Deadline, "refID", task.RefID)
@@ -473,7 +522,7 @@ func (di *Dispatcher) Consume(ctx context.Context, nm string) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case gate <- token:
+		case gate <- struct{}{}:
 			// Execution can go on a separate goroutine.
 			go func() {
 				defer func() { <-gate }()
@@ -484,10 +533,16 @@ func (di *Dispatcher) Consume(ctx context.Context, nm string) error {
 		}
 		return nil
 	}
-
 	for {
-		if err := one(ctx); err != nil {
-			return err
+		task := taskPool.Acquire()
+		if err := one(task); err != nil {
+			taskPool.Release(task)
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil
+			}
+			if !errors.Is(err, errContinue) {
+				return err
+			}
 		}
 	}
 }
@@ -566,6 +621,9 @@ func (di *Dispatcher) parse(ctx context.Context, task *Task, msg *godror.Message
 
 // execute calls do on the task, then calls answer with the answer.
 func (di *Dispatcher) execute(ctx context.Context, task *Task) error {
+	if di.conf.Debug != nil {
+		di.conf.Debug.Log("msg", "execute", "task", task)
+	}
 	if task.RefID == "" || task.Name == "" {
 		return ErrEmpty
 	}
@@ -628,6 +686,9 @@ func (di *Dispatcher) execute(ctx context.Context, task *Task) error {
 
 // answer puts the answer into the queue.
 func (di *Dispatcher) answer(refID string, payload []byte, err error) error {
+	if di.conf.Debug != nil {
+		di.conf.Debug.Log("msg", "answer", "refID", refID, "payload", payload, "error", err)
+	}
 	if di.putQ == nil {
 		return nil
 	}
