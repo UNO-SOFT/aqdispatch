@@ -220,7 +220,7 @@ func (di *Dispatcher) Run(ctx context.Context, taskNames []string) error {
 	grp, ctx := errgroup.WithContext(ctx)
 	for _, nm := range taskNames {
 		nm := nm
-		grp.Go(func() error { return di.consume(ctx, nm) })
+		grp.Go(func() error { return di.consume(ctx, nm, len(taskNames) <= 1) })
 	}
 	if di.conf.Debug != nil {
 		di.conf.Debug.Log("msg", "prepared consumers", "taskNames", taskNames)
@@ -378,6 +378,7 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 				nm = ""
 			}
 		}
+		q := di.diskQs[nm]
 		di.mu.RUnlock()
 		if !ok {
 			if firstErr == nil {
@@ -385,6 +386,16 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 			}
 			return errContinue
 		}
+		if q == nil {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case inCh <- task:
+				// Skip the disk queue
+			}
+			return nil
+		}
+
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -397,15 +408,6 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 				return err
 			}
 			di.Log("msg", "enqueue", "task", task.Name, "deadline", task.Deadline)
-			di.mu.RLock()
-			q, ok := di.diskQs[nm]
-			di.mu.RUnlock()
-			if !ok {
-				if firstErr == nil {
-					firstErr = ErrUnknownCommand
-				}
-				return errContinue
-			}
 			if err = q.Put(b); err != nil {
 				di.Log("msg", "enqueue", "queue", task.Name, "error", err)
 				return fmt.Errorf("put surplus task into %q queue: %w", task.Name, err)
@@ -440,14 +442,14 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 // then waits on the "nm" named channel for tasks.
 //
 // When nm is the empty string, that's a catch-all (not catched by others).
-func (di *Dispatcher) consume(ctx context.Context, nm string) error {
+func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error {
 	if di.conf.Debug != nil {
 		di.conf.Debug.Log("msg", "consume", "name", nm)
 	}
 	di.mu.RLock()
 	inCh, gate, q := di.ins[nm], di.gates[nm], di.diskQs[nm]
 	di.mu.RUnlock()
-	if inCh == nil || gate == nil || q == nil {
+	if inCh == nil || gate == nil || q == nil && !noDisQ {
 		di.mu.Lock()
 		inCh, gate, q = di.ins[nm], di.gates[nm], di.diskQs[nm]
 		if inCh == nil {
@@ -459,7 +461,7 @@ func (di *Dispatcher) consume(ctx context.Context, nm string) error {
 			di.gates[nm] = gate
 		}
 
-		if q == nil {
+		if q == nil && !noDisQ {
 			diskQLogger := log.With(di.conf.Logger, "lib", "diskqueue", "nm", nm)
 			q = diskqueue.New(di.conf.DisQPrefix+nm, di.conf.DisQPath,
 				di.conf.DisQMaxFileSize, di.conf.DisQMinMsgSize, di.conf.DisQMaxMsgSize,
@@ -481,6 +483,10 @@ func (di *Dispatcher) consume(ctx context.Context, nm string) error {
 	}
 
 	one := func(task *Task) error {
+		var qCh <-chan []byte
+		if q != nil {
+			qCh = q.ReadChan()
+		}
 		var ok bool
 		select {
 		case <-ctx.Done():
@@ -490,7 +496,7 @@ func (di *Dispatcher) consume(ctx context.Context, nm string) error {
 				return fmt.Errorf("%q: %w", nm, errChannelClosed)
 			}
 			// fast path
-		case b, ok := <-q.ReadChan():
+		case b, ok := <-qCh:
 			if !ok {
 				return nil
 			}
