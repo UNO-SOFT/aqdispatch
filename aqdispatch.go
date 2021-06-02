@@ -231,6 +231,10 @@ func (di *Dispatcher) Run(ctx context.Context, taskNames []string) error {
 		}
 		if err := di.batch(ctx); err != nil {
 			di.Log("msg", "batch finished", "error", err)
+			var ec interface{ Code() int }
+			if errors.As(err, &ec) && ec.Code() == 24010 { // ORA-24010: Queue does not exist
+				return err
+			}
 		}
 	}
 }
