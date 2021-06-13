@@ -30,7 +30,7 @@ import (
 	"github.com/UNO-SOFT/aqdispatch/pb"
 )
 
-//go:generate go get google.golang.org/protobuf/cmd/protoc-gen-go
+//go:generate go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
 //go:generate protoc --proto_path=pb --go_out=pb -I../../../ --go_opt=paths=source_relative pb/task.proto
 
 // Config of the Dispatcher.
