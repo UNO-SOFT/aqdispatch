@@ -147,6 +147,7 @@ func New(
 		do:      do,
 		ins:     make(map[string]chan *Task, conf.QueueCount),
 		diskQs:  make(map[string]diskqueue.Interface, conf.QueueCount),
+		gates:   make(map[string]chan struct{}, conf.QueueCount),
 		datas:   make(chan *godror.Data, conf.Concurrency),
 		buffers: make(chan *bytes.Buffer, conf.Concurrency),
 		deqMsgs: make([]godror.Message, conf.Concurrency),
@@ -253,6 +254,7 @@ type Dispatcher struct {
 	putQ         *godror.Queue
 	ins          map[string]chan *Task
 	diskQs       map[string]diskqueue.Interface
+	gates        map[string]chan struct{}
 	datas        chan *godror.Data
 	putObjects   chan *godror.Object
 	buffers      chan *bytes.Buffer
@@ -391,20 +393,20 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 			return errContinue
 		}
 		if q == nil {
+			// Skip the disk queue, wait for the channel
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
 			case inCh <- task:
-				// Skip the disk queue
+				return nil
 			}
-			return nil
 		}
 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case inCh <- task:
-			// Skip the disk queue
+			// Success
 		default:
 			// diskQs are for traffic jams
 			b, err := proto.Marshal(task)
@@ -451,16 +453,19 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 		di.conf.Debug.Log("msg", "consume", "name", nm)
 	}
 	di.mu.RLock()
-	inCh, q := di.ins[nm], di.diskQs[nm]
+	inCh, gate, q := di.ins[nm], di.gates[nm], di.diskQs[nm]
 	di.mu.RUnlock()
-	if inCh == nil || q == nil && !noDisQ {
+	if inCh == nil || gate == nil || q == nil && !noDisQ {
 		di.mu.Lock()
-		inCh, q = di.ins[nm], di.diskQs[nm]
+		inCh, gate, q = di.ins[nm], di.gates[nm], di.diskQs[nm]
 		if inCh == nil {
 			inCh = make(chan *Task)
 			di.ins[nm] = inCh
 		}
-
+		if gate == nil {
+			gate = make(chan struct{}, di.conf.Concurrency)
+			di.gates[nm] = gate
+		}
 		if q == nil && !noDisQ {
 			diskQLogger := log.With(di.conf.Logger, "lib", "diskqueue", "nm", nm)
 			q = diskqueue.New(di.conf.DisQPrefix+nm, di.conf.DisQPath,
@@ -481,12 +486,12 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 		}
 		di.mu.Unlock()
 	}
-
-	one := func(task *Task) error {
+	one := func() error {
 		var qCh <-chan []byte
 		if q != nil {
 			qCh = q.ReadChan()
 		}
+		var task *Task
 		var ok bool
 		select {
 		case <-ctx.Done():
@@ -500,12 +505,13 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 			if !ok {
 				return nil
 			}
+			task = taskPool.Acquire()
 			if err := proto.Unmarshal(b, task); err != nil {
 				di.Log("msg", "unmarshal", "bytes", b, "error", err)
-				taskPool.Release(task)
 				return errContinue
 			}
 		}
+		defer taskPool.Release(task)
 		if di.conf.Debug != nil {
 			di.conf.Debug.Log("msg", "consume", "task", task)
 		}
@@ -514,7 +520,6 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 		}
 		if task.Name == "" {
 			di.Log("msg", "empty task", "task", task)
-			taskPool.Release(task)
 			return errContinue
 		}
 		if !task.GetDeadline().AsTime().After(time.Now()) {
@@ -522,26 +527,31 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 			if task.RefID != "" {
 				_ = di.answer(task.RefID, nil, context.DeadlineExceeded)
 			}
-			taskPool.Release(task)
 			return nil
 		}
-		di.Log("msg", "execute queued", "task", task.Name, "deadline", task.Deadline, "payloadLen", len(task.Payload))
-		err := di.execute(ctx, task)
-		if err == nil || errors.Is(err, ErrAnswer) { // In case of ErrAnswer, task is executed, should not execute again!
-			taskPool.Release(task)
+		di.Log("msg", "begin", "task", task.Name, "deadline", task.Deadline, "payloadLen", len(task.Payload))
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case gate <- struct{}{}:
+			// Execute on a separate goroutine
+			go func() {
+				defer func() { <-gate }()
+				di.Log("msg", "end", "task", task.Name, "deadline", task.Deadline, "payloadLen", len(task.Payload))
+				di.execute(ctx, task)
+			}()
 		}
-		return err
+		return nil
 	}
 	for {
-		task := taskPool.Acquire()
-		if err := one(task); err != nil {
-			taskPool.Release(task)
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return nil
-			}
-			if !errors.Is(err, errContinue) {
-				return err
-			}
+		if err := one(); err == nil ||
+			errors.Is(err, context.DeadlineExceeded) ||
+			errors.Is(err, errContinue) {
+			continue
+		} else if errors.Is(err, context.Canceled) {
+			return nil
+		} else {
+			return err
 		}
 	}
 }
@@ -619,12 +629,12 @@ func (di *Dispatcher) parse(ctx context.Context, task *Task, msg *godror.Message
 }
 
 // execute calls do on the task, then calls answer with the answer.
-func (di *Dispatcher) execute(ctx context.Context, task *Task) error {
+func (di *Dispatcher) execute(ctx context.Context, task *Task) {
 	if di.conf.Debug != nil {
 		di.conf.Debug.Log("msg", "execute", "task", task)
 	}
 	if task.RefID == "" || task.Name == "" {
-		return ErrEmpty
+		return
 	}
 
 	logger := log.With(di.conf.Logger, "refID", task.RefID)
@@ -669,21 +679,17 @@ func (di *Dispatcher) execute(ctx context.Context, task *Task) error {
 		}
 	}()
 	if err := ctx.Err(); err != nil {
-		return err
+		return
 	}
 	start := time.Now()
 	callErr := di.do(ctx, res, task)
 	logger.Log("msg", "call", "dur", time.Since(start), "error", callErr)
 	if errors.Is(callErr, ErrExit) || di.putQ == nil {
-		return callErr
+		return
 	}
 	start = time.Now()
 	err := di.answer(task.RefID, res.Bytes(), callErr)
 	logger.Log("msg", "pack", "length", res.Len(), "dur", time.Since(start), "error", err)
-	if err != nil {
-		return fmt.Errorf("%w: %+v", ErrAnswer, err)
-	}
-	return err
 }
 
 // answer puts the answer into the queue.
