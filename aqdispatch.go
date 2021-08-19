@@ -32,6 +32,7 @@ import (
 
 //go:generate go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
 //go:generate protoc --proto_path=pb --go_out=pb -I../../../ --go_opt=paths=source_relative pb/task.proto
+//go:generate sed -i -e "/\"github.com\\/golang\\/protobuf\\/ptypes\\/timestamp\"/ s,\".*\",\"google.golang.org/protobuf/types/known/timestamppb\"," pb/task.pb.go
 
 // Config of the Dispatcher.
 type Config struct {
@@ -100,7 +101,7 @@ func New(
 	if conf.DisQPath == "" {
 		conf.DisQPath = "."
 	}
-	os.MkdirAll(conf.DisQPath, 0750)
+	_ = os.MkdirAll(conf.DisQPath, 0750)
 	if conf.DisQMinMsgSize <= 0 {
 		conf.DisQMinMsgSize = 1
 	}
@@ -146,7 +147,6 @@ func New(
 		do:      do,
 		ins:     make(map[string]chan *Task, conf.QueueCount),
 		diskQs:  make(map[string]diskqueue.Interface, conf.QueueCount),
-		gates:   make(map[string]chan struct{}, conf.QueueCount),
 		datas:   make(chan *godror.Data, conf.Concurrency),
 		buffers: make(chan *bytes.Buffer, conf.Concurrency),
 		deqMsgs: make([]godror.Message, conf.Concurrency),
@@ -253,7 +253,6 @@ type Dispatcher struct {
 	putQ         *godror.Queue
 	ins          map[string]chan *Task
 	diskQs       map[string]diskqueue.Interface
-	gates        map[string]chan struct{}
 	datas        chan *godror.Data
 	putObjects   chan *godror.Object
 	buffers      chan *bytes.Buffer
@@ -261,8 +260,8 @@ type Dispatcher struct {
 	deqMsgs      []godror.Message
 }
 
-func (di *Dispatcher) Log(keyvals ...interface{}) error {
-	return di.conf.Logger.Log(keyvals...)
+func (di *Dispatcher) Log(keyvals ...interface{}) {
+	_ = di.conf.Logger.Log(keyvals...)
 }
 
 // Decode the string from DB's encoding to UTF-8.
@@ -327,6 +326,7 @@ var (
 	ErrSkipResponse   = errors.New("skip response")
 	ErrEmpty          = errors.New("empty")
 	ErrExit           = errors.New("exit")
+	ErrAnswer         = errors.New("answer send error")
 
 	errChannelClosed = errors.New("channel is closed")
 	errContinue      = errors.New("continue")
@@ -451,18 +451,14 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 		di.conf.Debug.Log("msg", "consume", "name", nm)
 	}
 	di.mu.RLock()
-	inCh, gate, q := di.ins[nm], di.gates[nm], di.diskQs[nm]
+	inCh, q := di.ins[nm], di.diskQs[nm]
 	di.mu.RUnlock()
-	if inCh == nil || gate == nil || q == nil && !noDisQ {
+	if inCh == nil || q == nil && !noDisQ {
 		di.mu.Lock()
-		inCh, gate, q = di.ins[nm], di.gates[nm], di.diskQs[nm]
+		inCh, q = di.ins[nm], di.diskQs[nm]
 		if inCh == nil {
 			inCh = make(chan *Task)
 			di.ins[nm] = inCh
-		}
-		if gate == nil {
-			gate = make(chan struct{}, di.conf.Concurrency)
-			di.gates[nm] = gate
 		}
 
 		if q == nil && !noDisQ {
@@ -529,19 +525,12 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 			taskPool.Release(task)
 			return nil
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case gate <- struct{}{}:
-			// Execution can go on a separate goroutine.
-			go func() {
-				defer func() { <-gate }()
-				di.Log("msg", "execute queued", "task", task.Name, "deadline", task.Deadline, "payloadLen", len(task.Payload))
-				di.execute(ctx, task)
-				taskPool.Release(task)
-			}()
+		di.Log("msg", "execute queued", "task", task.Name, "deadline", task.Deadline, "payloadLen", len(task.Payload))
+		err := di.execute(ctx, task)
+		if err == nil || errors.Is(err, ErrAnswer) { // In case of ErrAnswer, task is executed, should not execute again!
+			taskPool.Release(task)
 		}
-		return nil
+		return err
 	}
 	for {
 		task := taskPool.Acquire()
@@ -685,12 +674,15 @@ func (di *Dispatcher) execute(ctx context.Context, task *Task) error {
 	start := time.Now()
 	callErr := di.do(ctx, res, task)
 	logger.Log("msg", "call", "dur", time.Since(start), "error", callErr)
-	if callErr == ErrExit || di.putQ == nil {
+	if errors.Is(callErr, ErrExit) || di.putQ == nil {
 		return callErr
 	}
 	start = time.Now()
 	err := di.answer(task.RefID, res.Bytes(), callErr)
 	logger.Log("msg", "pack", "length", res.Len(), "dur", time.Since(start), "error", err)
+	if err != nil {
+		return fmt.Errorf("%w: %+v", ErrAnswer, err)
+	}
 	return err
 }
 
@@ -769,9 +761,9 @@ Loop:
 	}
 	select {
 	case di.putObjects <- obj:
-		obj.ResetAttributes()
+		_ = obj.ResetAttributes()
 	default:
-		obj.Close()
+		_ = obj.Close()
 	}
 	return nil
 }
