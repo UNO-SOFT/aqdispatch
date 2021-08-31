@@ -413,7 +413,7 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			di.Log("msg", "enqueue", "task", task.Name, "deadline", task.Deadline)
+			di.Log("msg", "enqueue", "task", task.Name, "deadline", task.GetDeadline().AsTime().In(time.Local))
 			if err = q.Put(b); err != nil {
 				di.Log("msg", "enqueue", "queue", task.Name, "error", err)
 				return fmt.Errorf("put surplus task into %q queue: %w", task.Name, err)
@@ -511,7 +511,6 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 				return errContinue
 			}
 		}
-		defer taskPool.Release(task)
 		if di.conf.Debug != nil {
 			di.conf.Debug.Log("msg", "consume", "task", task)
 		}
@@ -520,25 +519,34 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 		}
 		if task.Name == "" {
 			di.Log("msg", "empty task", "task", task)
+			taskPool.Release(task)
 			return errContinue
 		}
-		if !task.GetDeadline().AsTime().After(time.Now()) {
-			di.Log("msg", "skip overtime", "deadline", task.Deadline, "refID", task.RefID)
+		var deadline time.Time
+		if dl := task.GetDeadline(); dl.IsValid() {
+			deadline = dl.AsTime().In(time.Local)
+		} else {
+			deadline = time.Now().Add(di.conf.Timeout)
+		}
+		if !deadline.After(time.Now()) {
+			di.Log("msg", "skip overtime", "deadline", deadline, "refID", task.RefID)
 			if task.RefID != "" {
 				_ = di.answer(task.RefID, nil, context.DeadlineExceeded)
 			}
+			taskPool.Release(task)
 			return nil
 		}
-		di.Log("msg", "begin", "task", task.Name, "deadline", task.Deadline, "payloadLen", len(task.Payload))
+		name := task.Name
+		di.Log("msg", "begin", "task", name, "deadline", deadline, "payloadLen", len(task.Payload))
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case gate <- struct{}{}:
 			// Execute on a separate goroutine
 			go func() {
-				defer func() { <-gate }()
-				di.Log("msg", "end", "task", task.Name, "deadline", task.Deadline, "payloadLen", len(task.Payload))
+				defer func() { <-gate; taskPool.Release(task) }()
 				di.execute(ctx, task)
+				di.Log("msg", "end", "task", name, "deadline", deadline)
 			}()
 		}
 		return nil
@@ -584,12 +592,13 @@ func (di *Dispatcher) parse(ctx context.Context, task *Task, msg *godror.Message
 		}
 	}()
 	task.RefID = msg.Correlation
-	task.Deadline = timestamppb.New(msg.Deadline())
-	if task.Deadline.IsValid() {
-		task.Deadline = timestamppb.New(task.Deadline.AsTime().Add(-1 * time.Second))
+	deadline := msg.Deadline()
+	if !deadline.IsZero() {
+		deadline = deadline.Add(-1 * time.Second).In(time.Local)
 	} else {
-		task.Deadline = timestamppb.New(time.Now().Add(di.conf.Timeout))
+		deadline = time.Now().Add(di.conf.Timeout)
 	}
+	task.Deadline = timestamppb.New(deadline)
 	if task.RefID == "" {
 		task.RefID = fmt.Sprintf("%X", msg.MsgID[:])
 	}
@@ -620,7 +629,9 @@ func (di *Dispatcher) parse(ctx context.Context, task *Task, msg *godror.Message
 	if task.Payload, err = ioutil.ReadAll(data.GetLob()); err != nil {
 		return fmt.Errorf("getLOB: %w", err)
 	}
-	logger.Log("msg", "parse", "name", task.Name, "payloadLen", len(task.Payload), "enqueued", msg.Enqueued, "delay", msg.Delay, "expiry", msg.Expiration, "deadline", task.Deadline)
+	logger.Log("msg", "parse", "name", task.Name, "payloadLen", len(task.Payload),
+		"enqueued", msg.Enqueued, "delay", msg.Delay.String(), "expiry", msg.Expiration.String(),
+		"deadline", deadline)
 	if task.RefID == "" || task.Name == "" {
 		return ErrEmpty
 	}
@@ -634,6 +645,7 @@ func (di *Dispatcher) execute(ctx context.Context, task *Task) {
 		di.conf.Debug.Log("msg", "execute", "task", task)
 	}
 	if task.RefID == "" || task.Name == "" {
+		di.Log("msg", "execute skip empty task", "task", task)
 		return
 	}
 
@@ -642,12 +654,14 @@ func (di *Dispatcher) execute(ctx context.Context, task *Task) {
 	if debug != nil {
 		debug = log.With(debug, "refID", task.RefID)
 	}
-	if task.Deadline.IsValid() {
+	var deadline time.Time
+	if dl := task.GetDeadline(); dl.IsValid() {
+		deadline = dl.AsTime().In(time.Local)
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithDeadline(ctx, task.Deadline.AsTime())
+		ctx, cancel = context.WithDeadline(ctx, deadline)
 		defer cancel()
 	}
-	logger.Log("msg", "execute", "name", task.Name, "payloadLen", len(task.Payload), "deadline", task.Deadline.AsTime().In(time.Local))
+	logger.Log("msg", "execute", "name", task.Name, "payloadLen", len(task.Payload), "deadline", deadline)
 	if debug != nil {
 		debug.Log("msg", "execute", "payload", string(task.Payload))
 	}
@@ -683,13 +697,13 @@ func (di *Dispatcher) execute(ctx context.Context, task *Task) {
 	}
 	start := time.Now()
 	callErr := di.do(ctx, res, task)
-	logger.Log("msg", "call", "dur", time.Since(start), "error", callErr)
+	logger.Log("msg", "call", "dur", time.Since(start).String(), "error", callErr)
 	if errors.Is(callErr, ErrExit) || di.putQ == nil {
 		return
 	}
 	start = time.Now()
 	err := di.answer(task.RefID, res.Bytes(), callErr)
-	logger.Log("msg", "pack", "length", res.Len(), "dur", time.Since(start), "error", err)
+	logger.Log("msg", "pack", "length", res.Len(), "dur", time.Since(start).String(), "error", err)
 }
 
 // answer puts the answer into the queue.
