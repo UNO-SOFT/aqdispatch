@@ -12,3 +12,5 @@ require (
 )
 
 require github.com/go-logfmt/logfmt v0.5.0 // indirect
+
+retract v0.3.5
