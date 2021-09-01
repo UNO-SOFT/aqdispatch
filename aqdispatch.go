@@ -413,7 +413,7 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			di.Log("msg", "enqueue", "task", task.Name, "deadline", task.GetDeadline().AsTime().In(time.Local))
+			di.Log("msg", "enqueue", "task", task.Name, "deadline", task.GetDeadline().AsTime())
 			if err = q.Put(b); err != nil {
 				di.Log("msg", "enqueue", "queue", task.Name, "error", err)
 				return fmt.Errorf("put surplus task into %q queue: %w", task.Name, err)
@@ -524,7 +524,7 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 		}
 		var deadline time.Time
 		if dl := task.GetDeadline(); dl.IsValid() {
-			deadline = dl.AsTime().In(time.Local)
+			deadline = dl.AsTime()
 		} else {
 			deadline = time.Now().Add(di.conf.Timeout)
 		}
@@ -594,7 +594,7 @@ func (di *Dispatcher) parse(ctx context.Context, task *Task, msg *godror.Message
 	task.RefID = msg.Correlation
 	deadline := msg.Deadline()
 	if !deadline.IsZero() {
-		deadline = deadline.Add(-1 * time.Second).In(time.Local)
+		deadline = deadline.Add(-1 * time.Second)
 	} else {
 		deadline = time.Now().Add(di.conf.Timeout)
 	}
@@ -656,7 +656,7 @@ func (di *Dispatcher) execute(ctx context.Context, task *Task) {
 	}
 	var deadline time.Time
 	if dl := task.GetDeadline(); dl.IsValid() {
-		deadline = dl.AsTime().In(time.Local)
+		deadline = dl.AsTime()
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithDeadline(ctx, deadline)
 		defer cancel()
