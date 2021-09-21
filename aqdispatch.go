@@ -624,15 +624,10 @@ func (di *Dispatcher) parse(ctx context.Context, task *Task, msg *godror.Message
 	if debug != nil {
 		debug.Log("msg", "get payload", "data", data)
 	}
-	var buf bytes.Buffer
-	godror.Log = logger.Log
-	if n, err := io.Copy(&buf, data.GetLob()); err != nil {
+    var err error
+	if task.Payload, err = io.ReadAll(data.GetLob()); err != nil {
 		return fmt.Errorf("getLOB: %w", err)
-	} else {
-		logger.Log("msg", "LOB read", "n", n, "length", buf.Len())
 	}
-	godror.Log = nil
-	task.Payload = buf.Bytes()
 	logger.Log("msg", "parse", "name", task.Name, "payloadLen", len(task.Payload),
 		"enqueued", msg.Enqueued, "delay", msg.Delay.String(), "expiry", msg.Expiration.String(),
 		"deadline", deadline)
