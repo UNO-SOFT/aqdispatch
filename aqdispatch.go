@@ -22,7 +22,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/go-kit/kit/log"
+	"github.com/go-kit/log"
 	"github.com/godror/godror"
 	"github.com/nsqio/go-diskqueue"
 
@@ -624,7 +624,7 @@ func (di *Dispatcher) parse(ctx context.Context, task *Task, msg *godror.Message
 	if debug != nil {
 		debug.Log("msg", "get payload", "data", data)
 	}
-    var err error
+	var err error
 	if task.Payload, err = io.ReadAll(data.GetLob()); err != nil {
 		return fmt.Errorf("getLOB: %w", err)
 	}
