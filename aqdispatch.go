@@ -625,9 +625,19 @@ func (di *Dispatcher) parse(ctx context.Context, task *Task, msg *godror.Message
 		debug.Log("msg", "get payload", "data", data)
 	}
 	var err error
-	if task.Payload, err = io.ReadAll(data.GetLob()); err != nil {
+	lob := data.GetLob()
+	// This asserts that lob is a BLOB!
+	size, err := lob.Size()
+	if err != nil {
 		return fmt.Errorf("getLOB: %w", err)
 	}
+	task.Payload = make([]byte, int(size))
+	n, err := io.ReadFull(lob, task.Payload)
+	task.Payload = task.Payload[:n]
+	if err != nil {
+		return fmt.Errorf("getLOB: %w", err)
+	}
+
 	logger.Log("msg", "parse", "name", task.Name, "payloadLen", len(task.Payload),
 		"enqueued", msg.Enqueued, "delay", msg.Delay.String(), "expiry", msg.Expiration.String(),
 		"deadline", deadline)
