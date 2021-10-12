@@ -4,7 +4,7 @@ go 1.17
 
 require (
 	github.com/go-kit/log v0.2.0
-	github.com/godror/godror v0.27.2-0.20211008064957-72617dba6096
+	github.com/godror/godror v0.28.0
 	github.com/nsqio/go-diskqueue v1.0.0
 	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
 	golang.org/x/text v0.3.7
