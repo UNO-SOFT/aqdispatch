@@ -1,4 +1,4 @@
-// Copyright 2021 Tamás Guácsi. All rights reserved.
+// Copyright 2021, 2022 Tamás Gulácsi. All rights reserved.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -172,6 +172,10 @@ func New(
 		return nil, err
 	}
 	di.Log("msg", "getQ", "name", di.getQ.Name())
+	if err = di.getQ.PurgeExpired(ctx); err != nil {
+		di.Close()
+		return nil, err
+	}
 	dOpts, err := di.getQ.DeqOptions()
 	if err != nil {
 		di.Close()
@@ -202,6 +206,10 @@ func New(
 		return nil, err
 	}
 	di.Log("msg", "putQ", "name", di.putQ.Name())
+	if err = di.putQ.PurgeExpired(ctx); err != nil {
+		di.Close()
+		return nil, err
+	}
 	eOpts, err := di.putQ.EnqOptions()
 	if err != nil {
 		di.Close()
@@ -213,6 +221,21 @@ func New(
 		return nil, err
 	}
 	return &di, nil
+}
+
+// PurgeExpired calls PurgeExpired on the underlying queues,
+// purging expired messages.
+func (di *Dispatcher) PurgeExpired(ctx context.Context) error {
+	var firstErr error
+	if di.getQ != nil {
+		firstErr = di.getQ.PurgeExpired(ctx)
+	}
+	if di.putQ != nil {
+		if err := di.putQ.PurgeExpired(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // Run the dispatcher, accepting tasks with names in taskNames.
