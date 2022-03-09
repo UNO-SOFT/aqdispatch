@@ -173,8 +173,7 @@ func New(
 	}
 	di.Log("msg", "getQ", "name", di.getQ.Name())
 	if err = di.getQ.PurgeExpired(ctx); err != nil {
-		di.Close()
-		return nil, err
+		di.Log("msg", "PurgeExpired", "queue", di.getQ.Name(), "error", err)
 	}
 	dOpts, err := di.getQ.DeqOptions()
 	if err != nil {
@@ -207,8 +206,7 @@ func New(
 	}
 	di.Log("msg", "putQ", "name", di.putQ.Name())
 	if err = di.putQ.PurgeExpired(ctx); err != nil {
-		di.Close()
-		return nil, err
+		di.Log("msg", "PurgeExpired", "queue", di.putQ.Name(), "error", err)
 	}
 	eOpts, err := di.putQ.EnqOptions()
 	if err != nil {
