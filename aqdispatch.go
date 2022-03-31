@@ -22,7 +22,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/go-kit/log"
+	"github.com/go-logr/logr"
 	"github.com/godror/godror"
 	"github.com/nsqio/go-diskqueue"
 
@@ -35,8 +35,7 @@ import (
 
 // Config of the Dispatcher.
 type Config struct {
-	log.Logger
-	Debug log.Logger
+	logr.Logger
 	//Tracer:     tracer,
 
 	// Enc is needed when DB sends/requires something other than UTF-8
@@ -129,9 +128,6 @@ func New(
 	if conf.QueueCount <= 0 {
 		conf.QueueCount = 1
 	}
-	if conf.Logger == nil {
-		conf.Logger = log.NewNopLogger()
-	}
 	if do == nil {
 		return nil, errors.New("do function cannot be nil")
 	}
@@ -171,9 +167,9 @@ func New(
 		di.Close()
 		return nil, err
 	}
-	di.Log("msg", "getQ", "name", di.getQ.Name())
+	di.conf.Info("getQ", "name", di.getQ.Name())
 	if err = di.getQ.PurgeExpired(ctx); err != nil {
-		di.Log("msg", "PurgeExpired", "queue", di.getQ.Name(), "error", err)
+		di.conf.Error(err, "PurgeExpired", "queue", di.getQ.Name())
 	}
 	dOpts, err := di.getQ.DeqOptions()
 	if err != nil {
@@ -204,9 +200,9 @@ func New(
 		di.Close()
 		return nil, err
 	}
-	di.Log("msg", "putQ", "name", di.putQ.Name())
+	di.conf.Info("putQ", "name", di.putQ.Name())
 	if err = di.putQ.PurgeExpired(ctx); err != nil {
-		di.Log("msg", "PurgeExpired", "queue", di.putQ.Name(), "error", err)
+		di.conf.Error(err, "PurgeExpired", "queue", di.putQ.Name())
 	}
 	eOpts, err := di.putQ.EnqOptions()
 	if err != nil {
@@ -243,15 +239,13 @@ func (di *Dispatcher) Run(ctx context.Context, taskNames []string) error {
 		nm := nm
 		grp.Go(func() error { return di.consume(ctx, nm, len(taskNames) <= 1) })
 	}
-	if di.conf.Debug != nil {
-		di.conf.Debug.Log("msg", "prepared consumers", "taskNames", taskNames)
-	}
+	di.conf.V(1).Info("prepared consumers", "taskNames", taskNames)
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if err := di.batch(ctx); err != nil {
-			di.Log("msg", "batch finished", "error", err)
+			di.conf.Error(err, "batch finished")
 			var ec interface{ Code() int }
 			if godror.IsBadConn(err) || errors.As(err, &ec) && ec.Code() == 24010 { // ORA-24010: Queue does not exist
 				return err
@@ -280,10 +274,6 @@ type Dispatcher struct {
 	buffers      chan *bytes.Buffer
 	Timezone     *time.Location
 	deqMsgs      []godror.Message
-}
-
-func (di *Dispatcher) Log(keyvals ...interface{}) {
-	_ = di.conf.Logger.Log(keyvals...)
 }
 
 // Decode the string from DB's encoding to UTF-8.
@@ -365,11 +355,9 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 	default:
 	}
 	n, err := di.getQ.Dequeue(di.deqMsgs[:])
-	if di.conf.Debug != nil {
-		di.conf.Debug.Log("msg", "dequeue", "n", n, "error", err)
-	}
+	di.conf.V(1).Info("dequeue", "n", n, "error", err)
 	if n > 0 || err != nil {
-		di.Log("msg", "dequeue", "n", n, "error", err)
+		di.conf.Info("dequeue", "n", n, "error", err)
 	}
 	if err != nil {
 		return err
@@ -397,9 +385,7 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 		di.mu.RLock()
 		inCh, ok := di.ins[nm]
 		if !ok {
-			if di.conf.Debug != nil {
-				di.conf.Debug.Log("msg", "unknown task", "name", nm)
-			}
+			di.conf.V(1).Info("unknown task", "name", nm)
 			if inCh, ok = di.ins[""]; ok {
 				nm = ""
 			}
@@ -433,9 +419,9 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			di.Log("msg", "enqueue", "task", task.Name, "deadline", task.GetDeadline().AsTime())
+			di.conf.Info("enqueue", "task", task.Name, "deadline", task.GetDeadline().AsTime())
 			if err = q.Put(b); err != nil {
-				di.Log("msg", "enqueue", "queue", task.Name, "error", err)
+				di.conf.Info("enqueue", "queue", task.Name, "error", err)
 				return fmt.Errorf("put surplus task into %q queue: %w", task.Name, err)
 			}
 			return errContinue // release Task
@@ -469,9 +455,7 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 //
 // When nm is the empty string, that's a catch-all (not catched by others).
 func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error {
-	if di.conf.Debug != nil {
-		di.conf.Debug.Log("msg", "consume", "name", nm)
-	}
+	di.conf.V(1).Info("consume", "name", nm)
 	di.mu.RLock()
 	inCh, gate, q := di.ins[nm], di.gates[nm], di.diskQs[nm]
 	di.mu.RUnlock()
@@ -487,13 +471,13 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 			di.gates[nm] = gate
 		}
 		if q == nil && !noDisQ {
-			diskQLogger := log.With(di.conf.Logger, "lib", "diskqueue", "nm", nm)
+			diskQLogger := di.conf.Logger.WithValues("lib", "diskqueue", "nm", nm)
 			q = diskqueue.New(di.conf.DisQPrefix+nm, di.conf.DisQPath,
 				di.conf.DisQMaxFileSize, di.conf.DisQMinMsgSize, di.conf.DisQMaxMsgSize,
 				di.conf.DisQSyncEvery, di.conf.DisQSyncTimeout,
 				func(lvl diskqueue.LogLevel, f string, args ...interface{}) {
 					if lvl >= diskqueue.INFO {
-						diskQLogger.Log("msg", fmt.Sprintf(f, args...))
+						diskQLogger.Info(fmt.Sprintf(f, args...))
 					}
 				})
 			if q.Depth() == 0 {
@@ -527,18 +511,16 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 			}
 			task = taskPool.Acquire()
 			if err := proto.Unmarshal(b, task); err != nil {
-				di.Log("msg", "unmarshal", "bytes", b, "error", err)
+				di.conf.Error(err, "unmarshal", "bytes", b)
 				return errContinue
 			}
 		}
-		if di.conf.Debug != nil {
-			di.conf.Debug.Log("msg", "consume", "task", task)
-		}
+		di.conf.V(1).Info("consume", "task", task)
 		if task == nil {
 			return errContinue
 		}
 		if task.Name == "" {
-			di.Log("msg", "empty task", "task", task)
+			di.conf.Info("empty task", "task", task)
 			taskPool.Release(task)
 			return errContinue
 		}
@@ -549,7 +531,7 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 			deadline = time.Now().Add(di.conf.Timeout)
 		}
 		if !deadline.After(time.Now()) {
-			di.Log("msg", "skip overtime", "deadline", deadline, "refID", task.RefID)
+			di.conf.Info("skip overtime", "deadline", deadline, "refID", task.RefID)
 			if task.RefID != "" {
 				_ = di.answer(task.RefID, nil, context.DeadlineExceeded)
 			}
@@ -557,7 +539,7 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 			return nil
 		}
 		name := task.Name
-		di.Log("msg", "begin", "task", name, "deadline", deadline, "payloadLen", len(task.Payload))
+		di.conf.Info("begin", "task", name, "deadline", deadline, "payloadLen", len(task.Payload))
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -566,7 +548,7 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 			go func() {
 				defer func() { <-gate; taskPool.Release(task) }()
 				di.execute(ctx, task)
-				di.Log("msg", "end", "task", name, "deadline", deadline)
+				di.conf.Info("end", "task", name, "deadline", deadline)
 			}()
 		}
 		return nil
@@ -622,29 +604,19 @@ func (di *Dispatcher) parse(ctx context.Context, task *Task, msg *godror.Message
 	if task.RefID == "" {
 		task.RefID = fmt.Sprintf("%X", msg.MsgID[:])
 	}
-	logger := log.With(di.conf.Logger, "refID", task.RefID)
-	debug := di.conf.Debug
-	if debug != nil {
-		debug = log.With(debug, "refID", task.RefID)
-	}
+	logger := di.conf.Logger.WithValues("refID", task.RefID)
 	obj := msg.Object
-	if debug != nil {
-		debug.Log("msg", msg, "obj", obj)
-	}
+	logger.V(1).Info("received", "msg", msg, "obj", obj)
 	if err := obj.GetAttribute(data, di.conf.RequestKeyName); err != nil {
 		return fmt.Errorf("get %s: %w", di.conf.RequestKeyName, err)
 	}
 	task.Name = string(data.GetBytes())
-	if debug != nil {
-		debug.Log("msg", "get task name", "data", data, "name", task.Name)
-	}
+	logger.V(1).Info("get task name", "data", data, "name", task.Name)
 
 	if err := obj.GetAttribute(data, di.conf.RequestKeyPayload); err != nil {
 		return fmt.Errorf("get %s: %w", di.conf.RequestKeyPayload, err)
 	}
-	if debug != nil {
-		debug.Log("msg", "get payload", "data", data)
-	}
+	logger.V(1).Info("get payload", "data", data)
 	var err error
 	lob := data.GetLob()
 	// This asserts that lob is a BLOB!
@@ -659,7 +631,7 @@ func (di *Dispatcher) parse(ctx context.Context, task *Task, msg *godror.Message
 		return fmt.Errorf("getLOB: %w", err)
 	}
 
-	logger.Log("msg", "parse", "name", task.Name, "payloadLen", len(task.Payload),
+	logger.Info("parse", "name", task.Name, "payloadLen", len(task.Payload),
 		"enqueued", msg.Enqueued, "delay", msg.Delay.String(), "expiry", msg.Expiration.String(),
 		"deadline", deadline)
 	if task.RefID == "" || task.Name == "" {
@@ -671,19 +643,13 @@ func (di *Dispatcher) parse(ctx context.Context, task *Task, msg *godror.Message
 
 // execute calls do on the task, then calls answer with the answer.
 func (di *Dispatcher) execute(ctx context.Context, task *Task) {
-	if di.conf.Debug != nil {
-		di.conf.Debug.Log("msg", "execute", "task", task)
-	}
+	di.conf.V(1).Info("execute", "task", task)
 	if task.RefID == "" || task.Name == "" {
-		di.Log("msg", "execute skip empty task", "task", task)
+		di.conf.Info("execute skip empty task", "task", task)
 		return
 	}
 
-	logger := log.With(di.conf.Logger, "refID", task.RefID)
-	debug := di.conf.Debug
-	if debug != nil {
-		debug = log.With(debug, "refID", task.RefID)
-	}
+	logger := di.conf.Logger.WithValues("refID", task.RefID)
 	var deadline time.Time
 	if dl := task.GetDeadline(); dl.IsValid() {
 		deadline = dl.AsTime()
@@ -691,10 +657,8 @@ func (di *Dispatcher) execute(ctx context.Context, task *Task) {
 		ctx, cancel = context.WithDeadline(ctx, deadline)
 		defer cancel()
 	}
-	logger.Log("msg", "execute", "name", task.Name, "payloadLen", len(task.Payload), "deadline", deadline)
-	if debug != nil {
-		debug.Log("msg", "execute", "payload", string(task.Payload))
-	}
+	logger.Info("execute", "name", task.Name, "payloadLen", len(task.Payload), "deadline", deadline)
+	logger.V(1).Info("execute", "payload", string(task.Payload))
 	/*
 		if di.Tracer != nil {
 			tCtx, span := di.Tracer.Start(ctx, "task="+task.Name)
@@ -703,9 +667,7 @@ func (di *Dispatcher) execute(ctx context.Context, task *Task) {
 		}
 	*/
 
-	if debug != nil {
-		debug.Log("msg", "execute", "payload", string(task.Payload))
-	}
+	logger.V(1).Info("execute", "payload", string(task.Payload))
 
 	var res *bytes.Buffer
 	select {
@@ -727,20 +689,18 @@ func (di *Dispatcher) execute(ctx context.Context, task *Task) {
 	}
 	start := time.Now()
 	callErr := di.do(ctx, res, task)
-	logger.Log("msg", "call", "dur", time.Since(start).String(), "error", callErr)
+	logger.Info("call", "dur", time.Since(start).String(), "error", callErr)
 	if errors.Is(callErr, ErrExit) || di.putQ == nil {
 		return
 	}
 	start = time.Now()
 	err := di.answer(task.RefID, res.Bytes(), callErr)
-	logger.Log("msg", "pack", "length", res.Len(), "dur", time.Since(start).String(), "error", err)
+	logger.Info("pack", "length", res.Len(), "dur", time.Since(start).String(), "error", err)
 }
 
 // answer puts the answer into the queue.
 func (di *Dispatcher) answer(refID string, payload []byte, err error) error {
-	if di.conf.Debug != nil {
-		di.conf.Debug.Log("msg", "answer", "refID", refID, "payload", payload, "error", err)
-	}
+	di.conf.V(1).Info("answer", "refID", refID, "payload", payload, "error", err)
 	if di.putQ == nil {
 		return nil
 	}
@@ -754,11 +714,9 @@ func (di *Dispatcher) answer(refID string, payload []byte, err error) error {
 			errMsg = errMsg[:1000]
 		}
 	}
-	logger := log.With(di.conf.Logger, "refID", refID)
-	logger.Log("msg", "answer", "errMsg", errMsg)
-	if di.conf.Debug != nil {
-		di.conf.Debug.Log("msg", "answer", "payload", string(payload))
-	}
+	logger := di.conf.Logger.WithValues("refID", refID)
+	logger.Info("answer", "errMsg", errMsg)
+	di.conf.V(1).Info("answer", "payload", string(payload))
 
 	var obj *godror.Object
 Loop:
@@ -782,9 +740,7 @@ Loop:
 		}
 	}
 	if obj == nil {
-		if di.conf.Debug != nil {
-			di.conf.Debug.Log("msg", "create", "object", di.putQ.PayloadObjectType)
-		}
+		di.conf.V(1).Info("create", "object", di.putQ.PayloadObjectType)
 		if obj, err = di.putQ.PayloadObjectType.NewObject(); err != nil {
 			return err
 		}
