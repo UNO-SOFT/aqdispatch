@@ -63,6 +63,9 @@ type Config struct {
 	QueueCount int
 	// Concurrency is the number of concurrent RPCs.
 	Concurrency int
+
+	// Correlation specifies that only dequeue messages with the same correlation string.
+	Correlation string
 }
 
 // Task is a task.
@@ -80,7 +83,6 @@ func New(
 	inQName, inQType string,
 	do func(context.Context, io.Writer, *Task) error,
 	outQName, outQType string,
-	correlation string,
 ) (*Dispatcher, error) {
 	if conf.RequestKeyName == "" {
 		conf.RequestKeyName = "NAME"
@@ -181,7 +183,7 @@ func New(
 	dOpts.Navigation = godror.NavFirst
 	dOpts.Visibility = godror.VisibleImmediate
 	dOpts.Wait = conf.PipeTimeout
-	dOpts.Correlation = correlation
+	dOpts.Correlation = conf.Correlation
 	if err = di.getQ.SetDeqOptions(dOpts); err != nil {
 		di.Close()
 		return nil, err
