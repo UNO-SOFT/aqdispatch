@@ -80,6 +80,7 @@ func New(
 	inQName, inQType string,
 	do func(context.Context, io.Writer, *Task) error,
 	outQName, outQType string,
+	correlation string,
 ) (*Dispatcher, error) {
 	if conf.RequestKeyName == "" {
 		conf.RequestKeyName = "NAME"
@@ -180,6 +181,7 @@ func New(
 	dOpts.Navigation = godror.NavFirst
 	dOpts.Visibility = godror.VisibleImmediate
 	dOpts.Wait = conf.PipeTimeout
+	dOpts.Correlation = correlation
 	if err = di.getQ.SetDeqOptions(dOpts); err != nil {
 		di.Close()
 		return nil, err
