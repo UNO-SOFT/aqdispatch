@@ -102,6 +102,7 @@ func New(
 	if conf.DisQPath == "" {
 		conf.DisQPath = "."
 	}
+	// nosemgrep: go.lang.correctness.permissions.file_permission.incorrect-default-permission
 	_ = os.MkdirAll(conf.DisQPath, 0750)
 	if conf.DisQMinMsgSize <= 0 {
 		conf.DisQMinMsgSize = 1
@@ -166,10 +167,12 @@ func New(
 		di.Close()
 		return nil, err
 	}
-	if di.getQ, err = godror.NewQueue(ctx, getCx, inQName, inQType); err != nil {
+	getQ, err := godror.NewQueue(ctx, getCx, inQName, inQType)
+	if err != nil {
 		di.Close()
 		return nil, err
 	}
+	di.getQ = getQ
 	di.conf.Info("getQ", "name", di.getQ.Name())
 	if err = di.getQ.PurgeExpired(ctx); err != nil {
 		di.conf.Error(err, "PurgeExpired", "queue", di.getQ.Name())
@@ -200,10 +203,12 @@ func New(
 		return nil, err
 	}
 	di.putCx = putCx
-	if di.putQ, err = godror.NewQueue(ctx, putCx, outQName, outQType); err != nil {
+	putQ, err := godror.NewQueue(ctx, putCx, outQName, outQType)
+	if err != nil {
 		di.Close()
 		return nil, err
 	}
+	di.putQ = putQ
 	di.conf.Info("putQ", "name", di.putQ.Name())
 	if err = di.putQ.PurgeExpired(ctx); err != nil {
 		di.conf.Error(err, "PurgeExpired", "queue", di.putQ.Name())
