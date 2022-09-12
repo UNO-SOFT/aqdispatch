@@ -249,15 +249,32 @@ func (di *Dispatcher) Run(ctx context.Context, taskNames []string) error {
 		grp.Go(func() error { return di.consume(ctx, nm, len(taskNames) <= 1) })
 	}
 	di.conf.V(1).Info("prepared consumers", "taskNames", taskNames)
+	timer := time.NewTimer(di.conf.PipeTimeout)
+	var ec interface{ Code() int }
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if err := di.batch(ctx); err != nil {
 			di.conf.Error(err, "batch finished")
-			var ec interface{ Code() int }
-			if godror.IsBadConn(err) || errors.As(err, &ec) && ec.Code() == 24010 { // ORA-24010: Queue does not exist
+			if godror.IsBadConn(err) {
 				return err
+			} else if errors.As(err, &ec) {
+				switch ec.Code() {
+				case 24010, // ORA-24010: Queue does not exist
+					25226: // ORA-25226: dequeue failed, queue is not enabled for dequeue
+					return err
+				}
+			}
+			// Wait 10s before trying again
+			timer.Reset(di.conf.PipeTimeout)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return ctx.Err()
 			}
 		}
 	}
@@ -364,13 +381,11 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 	default:
 	}
 	n, err := di.getQ.Dequeue(di.deqMsgs[:])
-	di.conf.V(1).Info("dequeue", "n", n, "error", err)
-	if n > 0 || err != nil {
-		di.conf.Info("dequeue", "n", n, "error", err)
-	}
 	if err != nil {
+		di.conf.Error(err, "dequeue")
 		return err
 	}
+	di.conf.V(1).Info("dequeue", "n", n)
 	if n == 0 {
 		return nil
 	}
