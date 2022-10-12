@@ -266,14 +266,17 @@ func (di *Dispatcher) Run(ctx context.Context, taskNames []string) error {
 					return err
 				}
 			}
+			if !di.conf.PipeTimeout.Stop {
+				select {
+				case <-di.conf.PipeTimeout.C:
+				default:
+				}
+			}
 			// Wait 10s before trying again
 			timer.Reset(di.conf.PipeTimeout)
 			select {
 			case <-timer.C:
 			case <-ctx.Done():
-				if !timer.Stop() {
-					<-timer.C
-				}
 				return ctx.Err()
 			}
 		}
