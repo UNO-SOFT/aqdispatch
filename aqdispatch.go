@@ -257,7 +257,7 @@ func (di *Dispatcher) Run(ctx context.Context, taskNames []string) error {
 		}
 		if err := di.batch(ctx); err != nil {
 			di.conf.Error(err, "batch finished")
-			if godror.IsBadConn(err) {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || godror.IsBadConn(err) {
 				return err
 			} else if errors.As(err, &ec) {
 				switch ec.Code() {
