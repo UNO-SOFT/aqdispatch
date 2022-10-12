@@ -266,9 +266,9 @@ func (di *Dispatcher) Run(ctx context.Context, taskNames []string) error {
 					return err
 				}
 			}
-			if !di.conf.PipeTimeout.Stop {
+			if !timer.Stop() {
 				select {
-				case <-di.conf.PipeTimeout.C:
+				case <-timer.C:
 				default:
 				}
 			}
@@ -383,15 +383,19 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 		return ctx.Err()
 	default:
 	}
-	n, err := di.getQ.Dequeue(di.deqMsgs[:])
+	di.mu.RLock()
+	msgs, conf := di.deqMsgs[:], di.conf
+	di.mu.RUnlock()
+	n, err := di.getQ.Dequeue(msgs)
 	if err != nil {
-		di.conf.Error(err, "dequeue")
+		conf.Error(err, "dequeue")
 		return err
 	}
-	di.conf.V(1).Info("dequeue", "n", n)
+	conf.V(1).Info("dequeue", "n", n)
 	if n == 0 {
 		return nil
 	}
+	msgs = msgs[:n]
 
 	var firstErr error
 	one := func(ctx context.Context, task *Task, msg *godror.Message) error {
@@ -412,7 +416,7 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 		di.mu.RLock()
 		inCh, ok := di.ins[nm]
 		if !ok {
-			di.conf.V(1).Info("unknown task", "name", nm)
+			conf.V(1).Info("unknown task", "name", nm)
 			if inCh, ok = di.ins[""]; ok {
 				nm = ""
 			}
@@ -446,9 +450,9 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			di.conf.Info("enqueue", "task", task.Name, "deadline", task.GetDeadline().AsTime())
+			conf.Info("enqueue", "task", task.Name, "deadline", task.GetDeadline().AsTime())
 			if err = q.Put(b); err != nil {
-				di.conf.Info("enqueue", "queue", task.Name, "error", err)
+				conf.Info("enqueue", "queue", task.Name, "error", err)
 				return fmt.Errorf("put surplus task into %q queue: %w", task.Name, err)
 			}
 			return errContinue // release Task
@@ -456,11 +460,11 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, di.conf.Timeout)
+	ctx, cancel := context.WithTimeout(ctx, conf.Timeout)
 	defer cancel()
-	for i := range di.deqMsgs[:n] {
+	for i := range msgs {
 		task := taskPool.Acquire()
-		if err := one(ctx, task, &di.deqMsgs[i]); err != nil {
+		if err := one(ctx, task, &msgs[i]); err != nil {
 			taskPool.Release(task)
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return nil
