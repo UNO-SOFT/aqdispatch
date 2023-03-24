@@ -35,28 +35,32 @@ import (
 
 // Config of the Dispatcher.
 type Config struct {
-	logr.Logger
-	//Tracer:     tracer,
 
 	// Enc is needed when DB sends/requires something other than UTF-8
 	Enc encoding.Encoding
 
-	// DisQPrefix is the diskqueue file's prefix.
-	DisQPrefix string
-	// DisQPath is the path for the diskqueue.
-	DisQPath                       string
-	DisQMaxFileSize, DisQSyncEvery int64
-	DisQMinMsgSize, DisQMaxMsgSize int32
-	DisQSyncTimeout                time.Duration
+	logr.Logger
+	//Tracer:     tracer,
 
 	// RequestKeyName is the attribute name instead of NAME.
 	RequestKeyName string
-	// RequestKeyPayload is the attribute name instead of PAYLOAD
-	RequestKeyPayload string
-	// ResponseKeyErrMsg is the attribute name instead of ERRMSG
-	ResponseKeyErrMsg string
+
+	// DisQPrefix is the diskqueue file's prefix.
+	DisQPrefix string
+	// DisQPath is the path for the diskqueue.
+	DisQPath string
+
+	// Correlation specifies that only dequeue messages with the same correlation string.
+	Correlation string
 	// ResponseKeyPayload is the attribute name instead of PAYLOAD
 	ResponseKeyPayload string
+
+	// ResponseKeyErrMsg is the attribute name instead of ERRMSG
+	ResponseKeyErrMsg string
+	// RequestKeyPayload is the attribute name instead of PAYLOAD
+	RequestKeyPayload              string
+	DisQMaxFileSize, DisQSyncEvery int64
+	DisQSyncTimeout                time.Duration
 
 	Timeout, PipeTimeout time.Duration
 	// QueueCount is the approximate number of queues dispatched over this AQ.
@@ -64,8 +68,7 @@ type Config struct {
 	// Concurrency is the number of concurrent RPCs.
 	Concurrency int
 
-	// Correlation specifies that only dequeue messages with the same correlation string.
-	Correlation string
+	DisQMinMsgSize, DisQMaxMsgSize int32
 }
 
 // Task is a task.
@@ -289,12 +292,10 @@ func (di *Dispatcher) Run(ctx context.Context, taskNames []string) error {
 // If Concurrency allows, calls the do function given in New,
 // and sends the answer as PAYLOAD of what that writes as response.
 type Dispatcher struct {
-	conf         Config
-	do           func(context.Context, io.Writer, *Task) error
 	getCx, putCx io.Closer
-	mu           sync.RWMutex
-	getQ         *godror.Queue
 	putQ         *godror.Queue
+	do           func(context.Context, io.Writer, *Task) error
+	getQ         *godror.Queue
 	ins          map[string]chan *Task
 	diskQs       map[string]diskqueue.Interface
 	gates        map[string]chan struct{}
@@ -302,7 +303,9 @@ type Dispatcher struct {
 	putObjects   chan *godror.Object
 	buffers      chan *bytes.Buffer
 	Timezone     *time.Location
+	conf         Config
 	deqMsgs      []godror.Message
+	mu           sync.RWMutex
 }
 
 // Decode the string from DB's encoding to UTF-8.
