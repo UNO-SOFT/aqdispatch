@@ -16,13 +16,13 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/exp/slog"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/text/encoding"
 
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/go-logr/logr"
 	"github.com/godror/godror"
 	"github.com/nsqio/go-diskqueue"
 
@@ -39,7 +39,7 @@ type Config struct {
 	// Enc is needed when DB sends/requires something other than UTF-8
 	Enc encoding.Encoding
 
-	logr.Logger
+	*slog.Logger
 	//Tracer:     tracer,
 
 	// RequestKeyName is the attribute name instead of NAME.
@@ -178,7 +178,7 @@ func New(
 	di.getQ = getQ
 	di.conf.Info("getQ", "name", di.getQ.Name())
 	if err = di.getQ.PurgeExpired(ctx); err != nil {
-		di.conf.Error(err, "PurgeExpired", "queue", di.getQ.Name())
+		di.conf.Error("PurgeExpired", "queue", di.getQ.Name(), "error", err)
 	}
 	dOpts, err := di.getQ.DeqOptions()
 	if err != nil {
@@ -214,7 +214,7 @@ func New(
 	di.putQ = putQ
 	di.conf.Info("putQ", "name", di.putQ.Name())
 	if err = di.putQ.PurgeExpired(ctx); err != nil {
-		di.conf.Error(err, "PurgeExpired", "queue", di.putQ.Name())
+		di.conf.Error("PurgeExpired", "queue", di.putQ.Name(), "error", err)
 	}
 	eOpts, err := di.putQ.EnqOptions()
 	if err != nil {
@@ -251,7 +251,7 @@ func (di *Dispatcher) Run(ctx context.Context, taskNames []string) error {
 		nm := nm
 		grp.Go(func() error { return di.consume(ctx, nm, len(taskNames) <= 1) })
 	}
-	di.conf.V(1).Info("prepared consumers", "taskNames", taskNames)
+	di.conf.Debug("prepared consumers", "taskNames", taskNames)
 	timer := time.NewTimer(di.conf.PipeTimeout)
 	var ec interface{ Code() int }
 	for {
@@ -259,7 +259,7 @@ func (di *Dispatcher) Run(ctx context.Context, taskNames []string) error {
 			return err
 		}
 		if err := di.batch(ctx); err != nil {
-			di.conf.Error(err, "batch finished")
+			di.conf.Error("batch finished", "error", err)
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || godror.IsBadConn(err) {
 				return err
 			} else if errors.As(err, &ec) {
@@ -391,10 +391,10 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 	di.mu.RUnlock()
 	n, err := di.getQ.Dequeue(msgs)
 	if err != nil {
-		conf.Error(err, "dequeue")
+		conf.Error("dequeue", "error", err)
 		return err
 	}
-	conf.V(1).Info("dequeue", "n", n)
+	conf.Debug("dequeue", "n", n)
 	if n == 0 {
 		return nil
 	}
@@ -419,7 +419,7 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 		di.mu.RLock()
 		inCh, ok := di.ins[nm]
 		if !ok {
-			conf.V(1).Info("unknown task", "name", nm)
+			conf.Debug("unknown task", "name", nm)
 			if inCh, ok = di.ins[""]; ok {
 				nm = ""
 			}
@@ -489,7 +489,7 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 //
 // When nm is the empty string, that's a catch-all (not catched by others).
 func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error {
-	di.conf.V(1).Info("consume", "name", nm)
+	di.conf.Debug("consume", "name", nm)
 	di.mu.RLock()
 	inCh, gate, q := di.ins[nm], di.gates[nm], di.diskQs[nm]
 	di.mu.RUnlock()
@@ -505,7 +505,7 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 			di.gates[nm] = gate
 		}
 		if q == nil && !noDisQ {
-			diskQLogger := di.conf.Logger.WithValues("lib", "diskqueue", "nm", nm)
+			diskQLogger := di.conf.Logger.With("lib", "diskqueue", "nm", nm)
 			q = diskqueue.New(di.conf.DisQPrefix+nm, di.conf.DisQPath,
 				di.conf.DisQMaxFileSize, di.conf.DisQMinMsgSize, di.conf.DisQMaxMsgSize,
 				di.conf.DisQSyncEvery, di.conf.DisQSyncTimeout,
@@ -545,11 +545,11 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 			}
 			task = taskPool.Acquire()
 			if err := proto.Unmarshal(b, task); err != nil {
-				di.conf.Error(err, "unmarshal", "bytes", b)
+				di.conf.Error("unmarshal", "bytes", b, "error", err)
 				return errContinue
 			}
 		}
-		di.conf.V(1).Info("consume", "task", task)
+		di.conf.Debug("consume", "task", task)
 		if task == nil {
 			return errContinue
 		}
@@ -638,19 +638,19 @@ func (di *Dispatcher) parse(ctx context.Context, task *Task, msg *godror.Message
 	if task.RefID == "" {
 		task.RefID = fmt.Sprintf("%X", msg.MsgID[:])
 	}
-	logger := di.conf.Logger.WithValues("refID", task.RefID)
+	logger := di.conf.Logger.With("refID", task.RefID)
 	obj := msg.Object
-	logger.V(1).Info("received", "msg", msg, "obj", obj)
+	logger.Debug("received", "msg", msg, "obj", obj)
 	if err := obj.GetAttribute(data, di.conf.RequestKeyName); err != nil {
 		return fmt.Errorf("get %s: %w", di.conf.RequestKeyName, err)
 	}
 	task.Name = string(data.GetBytes())
-	logger.V(1).Info("get task name", "data", data, "name", task.Name)
+	logger.Debug("get task name", "data", data, "name", task.Name)
 
 	if err := obj.GetAttribute(data, di.conf.RequestKeyPayload); err != nil {
 		return fmt.Errorf("get %s: %w", di.conf.RequestKeyPayload, err)
 	}
-	logger.V(1).Info("get payload", "data", data)
+	logger.Debug("get payload", "data", data)
 	var err error
 	lob := data.GetLob()
 	// This asserts that lob is a BLOB!
@@ -677,13 +677,13 @@ func (di *Dispatcher) parse(ctx context.Context, task *Task, msg *godror.Message
 
 // execute calls do on the task, then calls answer with the answer.
 func (di *Dispatcher) execute(ctx context.Context, task *Task) {
-	di.conf.V(1).Info("execute", "task", task)
+	di.conf.Debug("execute", "task", task)
 	if task.RefID == "" || task.Name == "" {
 		di.conf.Info("execute skip empty task", "task", task)
 		return
 	}
 
-	logger := di.conf.Logger.WithValues("refID", task.RefID)
+	logger := di.conf.Logger.With("refID", task.RefID)
 	var deadline time.Time
 	if dl := task.GetDeadline(); dl.IsValid() {
 		deadline = dl.AsTime()
@@ -692,7 +692,7 @@ func (di *Dispatcher) execute(ctx context.Context, task *Task) {
 		defer cancel()
 	}
 	logger.Info("execute", "name", task.Name, "payloadLen", len(task.Payload), "deadline", deadline)
-	logger.V(1).Info("execute", "payload", string(task.Payload))
+	logger.Debug("execute", "payload", string(task.Payload))
 	/*
 		if di.Tracer != nil {
 			tCtx, span := di.Tracer.Start(ctx, "task="+task.Name)
@@ -701,7 +701,7 @@ func (di *Dispatcher) execute(ctx context.Context, task *Task) {
 		}
 	*/
 
-	logger.V(1).Info("execute", "payload", string(task.Payload))
+	logger.Debug("execute", "payload", string(task.Payload))
 
 	var res *bytes.Buffer
 	select {
@@ -734,7 +734,7 @@ func (di *Dispatcher) execute(ctx context.Context, task *Task) {
 
 // answer puts the answer into the queue.
 func (di *Dispatcher) answer(refID string, payload []byte, err error) error {
-	di.conf.V(1).Info("answer", "refID", refID, "payload", payload, "error", err)
+	di.conf.Debug("answer", "refID", refID, "payload", payload, "error", err)
 	if di.putQ == nil {
 		return nil
 	}
@@ -748,9 +748,9 @@ func (di *Dispatcher) answer(refID string, payload []byte, err error) error {
 			errMsg = errMsg[:1000]
 		}
 	}
-	logger := di.conf.Logger.WithValues("refID", refID)
+	logger := di.conf.Logger.With("refID", refID)
 	logger.Info("answer", "errMsg", errMsg)
-	di.conf.V(1).Info("answer", "payload", string(payload))
+	di.conf.Debug("answer", "payload", string(payload))
 
 	var obj *godror.Object
 Loop:
@@ -774,7 +774,7 @@ Loop:
 		}
 	}
 	if obj == nil {
-		di.conf.V(1).Info("create", "object", di.putQ.PayloadObjectType)
+		di.conf.Debug("create", "object", di.putQ.PayloadObjectType)
 		if obj, err = di.putQ.PayloadObjectType.NewObject(); err != nil {
 			return err
 		}
