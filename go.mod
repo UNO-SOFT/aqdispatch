@@ -3,7 +3,7 @@ module github.com/UNO-SOFT/aqdispatch
 go 1.17
 
 require (
-	github.com/godror/godror v0.37.0
+	github.com/godror/godror v0.37.1-0.20230708063457-1527aad07106
 	github.com/nsqio/go-diskqueue v1.1.0
 	golang.org/x/exp v0.0.0-20230515195305-f3d0a9c9a5cc
 	golang.org/x/sync v0.2.0
