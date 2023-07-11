@@ -12,5 +12,10 @@ message Task {
     reserved 3;  // Was: url
 	google.protobuf.Timestamp Deadline = 4;
 	bytes Payload = 5;
+	repeated Blob Blobs = 6;
+}
+
+message Blob {
+	bytes Bytes = 1;
 }
 

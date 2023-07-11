@@ -54,11 +54,16 @@ type Config struct {
 	Correlation string
 	// ResponseKeyPayload is the attribute name instead of PAYLOAD
 	ResponseKeyPayload string
+	// ResponseKeyBlob is the attribute name instead of BLOB
+	ResponseKeyBlob string
 
 	// ResponseKeyErrMsg is the attribute name instead of ERRMSG
 	ResponseKeyErrMsg string
 	// RequestKeyPayload is the attribute name instead of PAYLOAD
-	RequestKeyPayload              string
+	RequestKeyPayload string
+	// RequestKeyBlob is the attribute name instead of BLOB
+	RequestKeyBlob string
+
 	DisQMaxFileSize, DisQSyncEvery int64
 	DisQSyncTimeout                time.Duration
 
@@ -74,6 +79,9 @@ type Config struct {
 // Task is a task.
 type Task = pb.Task
 
+// DoFunc is the type of the function that processes the Task.
+type DoFunc func(context.Context, io.Writer, *Task) (io.Reader, error)
+
 // New returns a new Dispatcher, which receives inQType typed messages on inQName.
 //
 // Then it calls "do" function with the task, and sends its output as response
@@ -84,7 +92,7 @@ func New(
 	db *sql.DB,
 	conf Config,
 	inQName, inQType string,
-	do func(context.Context, io.Writer, *Task) error,
+	do DoFunc,
 	outQName, outQType string,
 ) (*Dispatcher, error) {
 	if conf.RequestKeyName == "" {
@@ -93,11 +101,17 @@ func New(
 	if conf.RequestKeyPayload == "" {
 		conf.RequestKeyPayload = "PAYLOAD"
 	}
+	if conf.RequestKeyBlob == "" {
+		conf.RequestKeyBlob = "BLOB"
+	}
 	if conf.ResponseKeyErrMsg == "" {
 		conf.ResponseKeyErrMsg = "ERRMSG"
 	}
 	if conf.ResponseKeyPayload == "" {
 		conf.ResponseKeyPayload = "PAYLOAD"
+	}
+	if conf.ResponseKeyBlob == "" {
+		conf.ResponseKeyBlob = "BLOB"
 	}
 	if conf.DisQPrefix == "" {
 		conf.DisQPrefix = "aqdispatch-"
@@ -194,6 +208,7 @@ func New(
 		di.Close()
 		return nil, err
 	}
+	_, di.getQHasBlob = getQ.PayloadObjectType.Attributes[di.conf.RequestKeyBlob]
 
 	if outQName == "" {
 		return &di, nil
@@ -206,6 +221,10 @@ func New(
 		return nil, err
 	}
 	di.putCx = putCx
+	if di.putConn, err = godror.DriverConn(ctx, putCx); err != nil {
+		di.Close()
+		return nil, err
+	}
 	putQ, err := godror.NewQueue(ctx, putCx, outQName, outQType)
 	if err != nil {
 		di.Close()
@@ -226,6 +245,7 @@ func New(
 		di.Close()
 		return nil, err
 	}
+	_, di.putQHasBlob = putQ.PayloadObjectType.Attributes[di.conf.ResponseKeyBlob]
 	return &di, nil
 }
 
@@ -292,20 +312,22 @@ func (di *Dispatcher) Run(ctx context.Context, taskNames []string) error {
 // If Concurrency allows, calls the do function given in New,
 // and sends the answer as PAYLOAD of what that writes as response.
 type Dispatcher struct {
-	getCx, putCx io.Closer
-	putQ         *godror.Queue
-	do           func(context.Context, io.Writer, *Task) error
-	getQ         *godror.Queue
-	ins          map[string]chan *Task
-	diskQs       map[string]diskqueue.Interface
-	gates        map[string]chan struct{}
-	datas        chan *godror.Data
-	putObjects   chan *godror.Object
-	buffers      chan *bytes.Buffer
-	Timezone     *time.Location
-	conf         Config
-	deqMsgs      []godror.Message
-	mu           sync.RWMutex
+	getCx, putCx             io.Closer
+	putConn                  godror.Conn
+	gates                    map[string]chan struct{}
+	putObjects               chan *godror.Object
+	getQ                     *godror.Queue
+	ins                      map[string]chan *Task
+	diskQs                   map[string]diskqueue.Interface
+	putQ                     *godror.Queue
+	datas                    chan *godror.Data
+	do                       DoFunc
+	buffers                  chan *bytes.Buffer
+	Timezone                 *time.Location
+	deqMsgs                  []godror.Message
+	conf                     Config
+	mu                       sync.RWMutex
+	getQHasBlob, putQHasBlob bool
 }
 
 // Decode the string from DB's encoding to UTF-8.
@@ -332,6 +354,7 @@ func (di *Dispatcher) Close() error {
 	defer di.mu.Unlock()
 	ins, putO, diskQs, getQ, putQ := di.ins, di.putObjects, di.diskQs, di.getQ, di.putQ
 	di.ins, di.putObjects, di.diskQs, di.getQ, di.putQ = nil, nil, nil, nil, nil
+	di.putConn = nil
 	for _, c := range ins {
 		close(c)
 	}
@@ -567,13 +590,13 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 		if !deadline.After(time.Now()) {
 			di.conf.Info("skip overtime", "deadline", deadline, "refID", task.RefID)
 			if task.RefID != "" {
-				_ = di.answer(task.RefID, nil, context.DeadlineExceeded)
+				_ = di.answer(task.RefID, nil, nil, context.DeadlineExceeded)
 			}
 			taskPool.Release(task)
 			return nil
 		}
 		name := task.Name
-		di.conf.Info("begin", "task", name, "deadline", deadline, "payloadLen", len(task.Payload))
+		di.conf.Info("begin", "task", name, "deadline", deadline, "payloadLen", len(task.Payload), "blobsCount", len(task.Blobs))
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -665,7 +688,26 @@ func (di *Dispatcher) parse(ctx context.Context, task *Task, msg *godror.Message
 		return fmt.Errorf("getLOB: %w", err)
 	}
 
-	logger.Info("parse", "name", task.Name, "payloadLen", len(task.Payload),
+	if di.getQHasBlob {
+		if err := obj.GetAttribute(data, di.conf.RequestKeyBlob); err != nil {
+			return fmt.Errorf("get %s: %w", di.conf.RequestKeyBlob, err)
+		}
+		lob = data.GetLob()
+		for {
+			b := make([]byte, 1<<20)
+			if n, err := io.ReadAtLeast(lob, b, 1<<19); n > 0 {
+				task.Blobs = append(task.Blobs, &pb.Blob{Bytes: b[:n]})
+			} else if err == nil {
+				continue
+			} else if errors.Is(err, io.ErrUnexpectedEOF) {
+				break
+			} else {
+				return err
+			}
+		}
+	}
+
+	logger.Info("parse", "name", task.Name, "payloadLen", len(task.Payload), "blobCount", len(task.Blobs),
 		"enqueued", msg.Enqueued, "delay", msg.Delay.String(), "expiry", msg.Expiration.String(),
 		"deadline", deadline)
 	if task.RefID == "" || task.Name == "" {
@@ -722,18 +764,18 @@ func (di *Dispatcher) execute(ctx context.Context, task *Task) {
 		return
 	}
 	start := time.Now()
-	callErr := di.do(ctx, res, task)
+	r, callErr := di.do(ctx, res, task)
 	logger.Info("call", "dur", time.Since(start).String(), "error", callErr)
 	if errors.Is(callErr, ErrExit) || di.putQ == nil {
 		return
 	}
 	start = time.Now()
-	err := di.answer(task.RefID, res.Bytes(), callErr)
+	err := di.answer(task.RefID, res.Bytes(), r, callErr)
 	logger.Info("pack", "length", res.Len(), "dur", time.Since(start).String(), "error", err)
 }
 
 // answer puts the answer into the queue.
-func (di *Dispatcher) answer(refID string, payload []byte, err error) error {
+func (di *Dispatcher) answer(refID string, payload []byte, blob io.Reader, err error) error {
 	di.conf.Debug("answer", "refID", refID, "payload", payload, "error", err)
 	if di.putQ == nil {
 		return nil
@@ -791,6 +833,32 @@ Loop:
 			return fmt.Errorf("set %s: %w", di.conf.ResponseKeyPayload, err)
 		}
 	}
+	if di.putQHasBlob && blob != nil {
+		b := make([]byte, 1<<20)
+		if n, err := io.ReadAtLeast(blob, b, 1<<19); n != 0 {
+			if err != nil { // this is all
+				if err = obj.Set(di.conf.ResponseKeyBlob, b[:n]); err != nil {
+					return fmt.Errorf("set %s: %w", di.conf.ResponseKeyBlob, err)
+				}
+			} else {
+				lob, err := di.putConn.NewTempLob(false)
+				if err != nil {
+					obj.Close()
+					return fmt.Errorf("create temp lob: %w", err)
+				}
+				defer lob.Close()
+				if _, err := io.Copy(io.NewOffsetWriter(lob, 0), blob); err != nil {
+					obj.Close()
+					return fmt.Errorf("write temp lob: %w", err)
+				}
+				if err = obj.Set(di.conf.ResponseKeyBlob, lob); err != nil {
+					obj.Close()
+					return fmt.Errorf("set %s: %w", di.conf.ResponseKeyBlob, err)
+				}
+			}
+		}
+	}
+
 	msg := godror.Message{
 		Correlation: refID,
 		Expiration:  di.conf.Timeout / time.Second,
