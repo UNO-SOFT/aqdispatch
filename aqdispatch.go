@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/exp/slog"
+	"log/slog"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/text/encoding"
 
