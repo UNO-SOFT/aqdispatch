@@ -16,9 +16,9 @@ import (
 	"sync"
 	"time"
 
-	"log/slog"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/text/encoding"
+	"log/slog"
 
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -192,7 +192,7 @@ func New(
 	di.getQ = getQ
 	di.conf.Info("getQ", "name", di.getQ.Name())
 	if err = di.getQ.PurgeExpired(ctx); err != nil {
-		di.conf.Error("PurgeExpired", "queue", di.getQ.Name(), "error", err)
+		di.conf.Warn("PurgeExpired", "queue", di.getQ.Name(), "error", err)
 	}
 	dOpts, err := di.getQ.DeqOptions()
 	if err != nil {
@@ -233,7 +233,7 @@ func New(
 	di.putQ = putQ
 	di.conf.Info("putQ", "name", di.putQ.Name())
 	if err = di.putQ.PurgeExpired(ctx); err != nil {
-		di.conf.Error("PurgeExpired", "queue", di.putQ.Name(), "error", err)
+		di.conf.Warn("PurgeExpired", "queue", di.putQ.Name(), "error", err)
 	}
 	eOpts, err := di.putQ.EnqOptions()
 	if err != nil {
