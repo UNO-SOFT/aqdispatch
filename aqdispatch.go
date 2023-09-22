@@ -54,14 +54,14 @@ type Config struct {
 	Correlation string
 	// ResponseKeyPayload is the attribute name instead of PAYLOAD
 	ResponseKeyPayload string
-	// ResponseKeyBlob is the attribute name instead of BLOB
+	// ResponseKeyBlob is the attribute name instead of AUX
 	ResponseKeyBlob string
 
 	// ResponseKeyErrMsg is the attribute name instead of ERRMSG
 	ResponseKeyErrMsg string
 	// RequestKeyPayload is the attribute name instead of PAYLOAD
 	RequestKeyPayload string
-	// RequestKeyBlob is the attribute name instead of BLOB
+	// RequestKeyBlob is the attribute name instead of AUX
 	RequestKeyBlob string
 
 	DisQMaxFileSize, DisQSyncEvery int64
@@ -102,7 +102,7 @@ func New(
 		conf.RequestKeyPayload = "PAYLOAD"
 	}
 	if conf.RequestKeyBlob == "" {
-		conf.RequestKeyBlob = "BLOB"
+		conf.RequestKeyBlob = "AUX"
 	}
 	if conf.ResponseKeyErrMsg == "" {
 		conf.ResponseKeyErrMsg = "ERRMSG"
@@ -111,7 +111,7 @@ func New(
 		conf.ResponseKeyPayload = "PAYLOAD"
 	}
 	if conf.ResponseKeyBlob == "" {
-		conf.ResponseKeyBlob = "BLOB"
+		conf.ResponseKeyBlob = "AUX"
 	}
 	if conf.DisQPrefix == "" {
 		conf.DisQPrefix = "aqdispatch-"
