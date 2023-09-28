@@ -533,7 +533,7 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 				di.conf.DisQMaxFileSize, di.conf.DisQMinMsgSize, di.conf.DisQMaxMsgSize,
 				di.conf.DisQSyncEvery, di.conf.DisQSyncTimeout,
 				func(lvl diskqueue.LogLevel, f string, args ...interface{}) {
-					if lvl >= diskqueue.INFO {
+					if diskQLogger != nil && lvl >= diskqueue.INFO {
 						diskQLogger.Info(fmt.Sprintf(f, args...))
 					}
 				})
@@ -692,17 +692,20 @@ func (di *Dispatcher) parse(ctx context.Context, task *Task, msg *godror.Message
 		if err := obj.GetAttribute(data, di.conf.RequestKeyBlob); err != nil {
 			return fmt.Errorf("get %s: %w", di.conf.RequestKeyBlob, err)
 		}
-		lob = data.GetLob()
-		for {
-			b := make([]byte, 1<<20)
-			if n, err := io.ReadAtLeast(lob, b, 1<<19); n > 0 {
-				task.Blobs = append(task.Blobs, &pb.Blob{Bytes: b[:n]})
-			} else if err == nil {
-				continue
-			} else if errors.Is(err, io.ErrUnexpectedEOF) {
-				break
-			} else {
-				return err
+		if !data.IsNull() {
+			if lob = data.GetLob(); lob != nil {
+				for {
+					b := make([]byte, 1<<20)
+					if n, err := io.ReadAtLeast(lob, b, 1<<19); n > 0 {
+						task.Blobs = append(task.Blobs, &pb.Blob{Bytes: b[:n]})
+					} else if err == nil {
+						continue
+					} else if errors.Is(err, io.ErrUnexpectedEOF) {
+						break
+					} else {
+						return err
+					}
+				}
 			}
 		}
 	}
