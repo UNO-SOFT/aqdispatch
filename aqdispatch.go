@@ -1,4 +1,4 @@
-// Copyright 2021, 2022 Tamás Gulácsi. All rights reserved.
+// Copyright 2021, 2024 Tamás Gulácsi. All rights reserved.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -451,7 +451,7 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 		di.mu.RUnlock()
 		if !ok {
 			if firstErr == nil {
-				firstErr = ErrUnknownCommand
+				firstErr = fmt.Errorf("%w: %q (task=%q)", ErrUnknownCommand, nm, task.Name)
 			}
 			return errContinue
 		}
