@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"runtime"
 	"sync"
@@ -18,15 +19,9 @@ import (
 
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/text/encoding"
-	"log/slog"
-
-	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/godror/godror"
 	"github.com/nsqio/go-diskqueue"
-
-	"github.com/UNO-SOFT/aqdispatch/pb"
 )
 
 //go:generate go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
@@ -77,7 +72,7 @@ type Config struct {
 }
 
 // Task is a task.
-type Task = pb.Task
+//type Task = pb.Task
 
 // DoFunc is the type of the function that processes the Task.
 type DoFunc func(context.Context, io.Writer, *Task) (io.Reader, error)
@@ -423,6 +418,7 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 	}
 	msgs = msgs[:n]
 
+	var b []byte
 	var firstErr error
 	one := func(ctx context.Context, task *Task, msg *godror.Message) error {
 		// The messages are tightly coupled with the queue,
@@ -472,11 +468,8 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 			// Success
 		default:
 			// diskQs are for traffic jams
-			b, err := proto.Marshal(task)
-			if err != nil {
-				return err
-			}
-			conf.Info("enqueue", "task", task.Name, "deadline", task.GetDeadline().AsTime())
+			b = MarshalProtobuf(b[:0], task)
+			conf.Info("enqueue", "task", task.Name, "deadline", task.Deadline) //task.GetDeadline().AsTime())
 			if err = q.Put(b); err != nil {
 				conf.Info("enqueue", "queue", task.Name, "error", err)
 				return fmt.Errorf("put surplus task into %q queue: %w", task.Name, err)
@@ -567,7 +560,7 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 				return nil
 			}
 			task = taskPool.Acquire()
-			if err := proto.Unmarshal(b, task); err != nil {
+			if err := task.UnmarshalProtobuf(b); err != nil {
 				di.conf.Error("unmarshal", "bytes", b, "error", err)
 				return errContinue
 			}
@@ -581,10 +574,11 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 			taskPool.Release(task)
 			return errContinue
 		}
-		var deadline time.Time
-		if dl := task.GetDeadline(); dl.IsValid() {
-			deadline = dl.AsTime()
-		} else {
+		//var deadline time.Time
+		//if dl := task.GetDeadline(); dl.IsValid() {
+		//	deadline = dl.AsTime()
+		deadline := task.Deadline
+		if deadline.IsZero() {
 			deadline = time.Now().Add(di.conf.Timeout)
 		}
 		if !deadline.After(time.Now()) {
@@ -657,7 +651,8 @@ func (di *Dispatcher) parse(ctx context.Context, task *Task, msg *godror.Message
 	} else {
 		deadline = time.Now().Add(di.conf.Timeout)
 	}
-	task.Deadline = timestamppb.New(deadline)
+	//task.Deadline = timestamppb.New(deadline)
+	task.Deadline = deadline
 	if task.RefID == "" {
 		task.RefID = fmt.Sprintf("%X", msg.MsgID[:])
 	}
@@ -697,7 +692,7 @@ func (di *Dispatcher) parse(ctx context.Context, task *Task, msg *godror.Message
 				for {
 					b := make([]byte, 1<<20)
 					if n, err := io.ReadAtLeast(lob, b, 1<<19); n > 0 {
-						task.Blobs = append(task.Blobs, &pb.Blob{Bytes: b[:n]})
+						task.Blobs = append(task.Blobs, &Blob{Bytes: b[:n]}) //&pb.Blob{Bytes: b[:n]})
 					} else if err == nil {
 						continue
 					} else if errors.Is(err, io.ErrUnexpectedEOF) {
@@ -729,9 +724,9 @@ func (di *Dispatcher) execute(ctx context.Context, task *Task) {
 	}
 
 	logger := di.conf.Logger.With("refID", task.RefID)
-	var deadline time.Time
-	if dl := task.GetDeadline(); dl.IsValid() {
-		deadline = dl.AsTime()
+	deadline := task.Deadline
+	//if dl := task.GetDeadline(); dl.IsValid() {
+	if !deadline.IsZero() {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithDeadline(ctx, deadline)
 		defer cancel()
