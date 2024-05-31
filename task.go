@@ -46,16 +46,21 @@ type protobufMarshaler interface {
 func (t Task) marshalProtobuf(mm *easyproto.MessageMarshaler) {
 	mm.AppendString(1, t.Name)
 	mm.AppendString(2, t.RefID)
-	newTimestamp(t.Deadline).marshalProtobuf(mm.AppendMessage(4))
+	// newTimestamp(t.Deadline).marshalProtobuf(mm.AppendMessage(4))
+	timeMarshalProtobuf(mm.AppendMessage(4), t.Deadline)
 	mm.AppendBytes(5, t.Payload)
 	for _, b := range t.Blobs {
 		b.marshalProtobuf(mm.AppendMessage(6))
 	}
 }
 
+func timeMarshalProtobuf(mm *easyproto.MessageMarshaler, t time.Time) {
+	mm.AppendInt64(1, t.Unix())
+	mm.AppendInt32(2, int32(t.Nanosecond()))
+}
+
 func newTimestamp(t time.Time) Timestamp {
-	u := t.UTC()
-	return Timestamp{Seconds: u.Unix(), Nanos: int32(u.Nanosecond())}
+	return Timestamp{Seconds: t.Unix(), Nanos: int32(t.Nanosecond())}
 }
 
 func (ts Timestamp) marshalProtobuf(mm *easyproto.MessageMarshaler) {
