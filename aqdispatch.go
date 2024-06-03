@@ -268,12 +268,15 @@ func (di *Dispatcher) Run(ctx context.Context, taskNames []string) error {
 	}
 	di.conf.Debug("prepared consumers", "taskNames", taskNames)
 	timer := time.NewTimer(di.conf.PipeTimeout)
-	var ec interface{ Code() int }
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if err := di.batch(ctx); err != nil {
+			if err == io.EOF {
+				continue
+			}
+			var ec interface{ Code() int }
 			di.conf.Error("batch finished", "error", err)
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || godror.IsBadConn(err) {
 				return err
@@ -425,6 +428,7 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 		// so we must parse them sequentially.
 		err = di.parse(ctx, task, msg)
 		if err != nil {
+			conf.Warn("parse", "error", err)
 			if errors.Is(err, ErrEmpty) {
 				return errContinue
 			}
@@ -438,7 +442,7 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 		di.mu.RLock()
 		inCh, ok := di.ins[nm]
 		if !ok {
-			conf.Debug("unknown task", "name", nm)
+			conf.Warn("unknown task", "name", nm)
 			if inCh, ok = di.ins[""]; ok {
 				nm = ""
 			}
@@ -447,6 +451,7 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 		di.mu.RUnlock()
 		if !ok {
 			if firstErr == nil {
+				conf.Error("unknown task", "name", nm, "task", task)
 				firstErr = fmt.Errorf("%w: %q (task=%q)", ErrUnknownCommand, nm, task.Name)
 			}
 			return errContinue
@@ -471,7 +476,7 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 			b = MarshalProtobuf(b[:0], task)
 			conf.Info("enqueue", "task", task.Name, "deadline", task.Deadline) //task.GetDeadline().AsTime())
 			if err = q.Put(b); err != nil {
-				conf.Info("enqueue", "queue", task.Name, "error", err)
+				conf.Error("enqueue", "queue", task.Name, "error", err)
 				return fmt.Errorf("put surplus task into %q queue: %w", task.Name, err)
 			}
 			return errContinue // release Task
@@ -484,6 +489,7 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 	for i := range msgs {
 		task := taskPool.Acquire()
 		if err := one(ctx, task, &msgs[i]); err != nil {
+			conf.Error("one", "task", task, "error", err)
 			taskPool.Release(task)
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return nil
@@ -492,6 +498,9 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 				return err
 			}
 		}
+	}
+	if firstErr != nil {
+		conf.Error("batch", "error", err)
 	}
 	return firstErr
 }
@@ -660,12 +669,14 @@ func (di *Dispatcher) parse(ctx context.Context, task *Task, msg *godror.Message
 	obj := msg.Object
 	logger.Debug("received", "msg", msg, "obj", obj)
 	if err := obj.GetAttribute(data, di.conf.RequestKeyName); err != nil {
+		logger.Error("GetAttribute", "key", di.conf.RequestKeyName, "error", err)
 		return fmt.Errorf("get %s: %w", di.conf.RequestKeyName, err)
 	}
 	task.Name = string(data.GetBytes())
 	logger.Debug("get task name", "data", data, "name", task.Name)
 
 	if err := obj.GetAttribute(data, di.conf.RequestKeyPayload); err != nil {
+		logger.Error("GetAttribute", "key", di.conf.RequestKeyPayload, "error", err)
 		return fmt.Errorf("get %s: %w", di.conf.RequestKeyPayload, err)
 	}
 	logger.Debug("get payload", "data", data)
@@ -680,11 +691,13 @@ func (di *Dispatcher) parse(ctx context.Context, task *Task, msg *godror.Message
 	n, err := io.ReadFull(lob, task.Payload)
 	task.Payload = task.Payload[:n]
 	if err != nil {
+		logger.Error("lob.ReadFull", "error", err)
 		return fmt.Errorf("getLOB: %w", err)
 	}
 
 	if di.getQHasBlob {
 		if err := obj.GetAttribute(data, di.conf.RequestKeyBlob); err != nil {
+			logger.Error("GetAttribute", "key", di.conf.RequestKeyBlob, "error", err)
 			return fmt.Errorf("get %s: %w", di.conf.RequestKeyBlob, err)
 		}
 		if !data.IsNull() {
@@ -698,6 +711,7 @@ func (di *Dispatcher) parse(ctx context.Context, task *Task, msg *godror.Message
 					} else if errors.Is(err, io.ErrUnexpectedEOF) {
 						break
 					} else {
+						logger.Error("read LOB", "error", err)
 						return err
 					}
 				}
