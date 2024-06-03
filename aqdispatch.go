@@ -708,7 +708,7 @@ func (di *Dispatcher) parse(ctx context.Context, task *Task, msg *godror.Message
 						task.Blobs = append(task.Blobs, &Blob{Bytes: b[:n]}) //&pb.Blob{Bytes: b[:n]})
 					} else if err == nil {
 						continue
-					} else if errors.Is(err, io.ErrUnexpectedEOF) {
+					} else if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
 						break
 					} else {
 						logger.Error("read LOB", "error", err)
