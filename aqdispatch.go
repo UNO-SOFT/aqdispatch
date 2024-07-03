@@ -49,8 +49,6 @@ type Config struct {
 	RequestKeyBlob string
 
 	Timeout, PipeTimeout time.Duration
-	// QueueCount is the approximate number of queues dispatched over this AQ.
-	QueueCount int
 	// Concurrency is the number of concurrent RPCs.
 	Concurrency int
 
@@ -103,9 +101,6 @@ func New(
 	if conf.Concurrency <= 0 {
 		conf.Concurrency = runtime.GOMAXPROCS(-1)
 	}
-	if conf.QueueCount <= 0 {
-		conf.QueueCount = 1
-	}
 	if do == nil {
 		return nil, errors.New("do function cannot be nil")
 	}
@@ -118,13 +113,12 @@ func New(
 	di := Dispatcher{
 		conf:    conf,
 		do:      do,
-		ins:     make(map[string]chan *Task, conf.QueueCount),
-		gates:   make(map[string]chan struct{}, conf.QueueCount),
-		getQs:   make(map[string]*godror.Queue, conf.QueueCount),
+		ins:     make(map[string]chan *Task, len(taskNames)),
+		gates:   make(map[string]chan struct{}, len(taskNames)),
+		getQs:   make(map[string]*godror.Queue, len(taskNames)),
 		datas:   make(chan *godror.Data, conf.Concurrency),
 		buffers: make(chan *bytes.Buffer, conf.Concurrency),
-		// deqMsgs: make([]godror.Message, conf.Concurrency),
-	}
+		deqMsgs: make(map[string][]godror.Message, len(taskNames))}
 
 	ctx := context.Background()
 	getCx, err := db.Conn(dbCtx(ctx, "aqdispatch", inQName))
@@ -182,6 +176,8 @@ func New(
 			return nil, err
 		}
 		di.getQs[nm] = getQ
+		di.deqMsgs[nm] = make([]godror.Message, conf.Concurrency)
+		di.ins[nm] = make(chan *Task)
 	}
 
 	if outQName == "" {
@@ -292,18 +288,18 @@ func (di *Dispatcher) Run(ctx context.Context) error {
 // If Concurrency allows, calls the do function given in New,
 // and sends the answer as PAYLOAD of what that writes as response.
 type Dispatcher struct {
-	getCx, putCx io.Closer
-	putConn      godror.Conn
-	gates        map[string]chan struct{}
-	putObjects   chan *godror.Object
-	ins          map[string]chan *Task
-	getQs        map[string]*godror.Queue
-	putQ         *godror.Queue
-	datas        chan *godror.Data
-	do           DoFunc
-	buffers      chan *bytes.Buffer
-	Timezone     *time.Location
-	// deqMsgs                  []godror.Message
+	getCx, putCx             io.Closer
+	putConn                  godror.Conn
+	deqMsgs                  map[string][]godror.Message
+	gates                    map[string]chan struct{}
+	putObjects               chan *godror.Object
+	ins                      map[string]chan *Task
+	getQs                    map[string]*godror.Queue
+	putQ                     *godror.Queue
+	datas                    chan *godror.Data
+	do                       DoFunc
+	buffers                  chan *bytes.Buffer
+	Timezone                 *time.Location
 	conf                     Config
 	mu                       sync.RWMutex
 	getQHasBlob, putQHasBlob bool
@@ -373,8 +369,9 @@ var (
 
 	errChannelClosed = errors.New("channel is closed")
 	errContinue      = errors.New("continue")
+
+	taskPool = tskPool{pool: &sync.Pool{New: func() interface{} { var t Task; return &t }}}
 )
-var taskPool = tskPool{pool: &sync.Pool{New: func() interface{} { var t Task; return &t }}}
 
 // batch process at most Config.Concurrency number of messages: wait at max Config.Timeout,
 // then for each message, decode it, send to the named channel if possible,
@@ -387,9 +384,16 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 	}
 
 	var firstErr error
-	one := func(ctx context.Context, task *Task, msg *godror.Message) error {
+	one := func(ctx context.Context, nm string, inCh chan<- *Task, msg *godror.Message) error {
 		// The messages are tightly coupled with the queue,
 		// so we must parse them sequentially.
+		task := taskPool.Acquire()
+		var keepTask bool
+		func() {
+			if !keepTask {
+				taskPool.Release(task)
+			}
+		}()
 		err := di.parse(ctx, task, msg)
 		if err != nil {
 			di.conf.Warn("parse", "error", err)
@@ -401,37 +405,26 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 			}
 			return errContinue
 		}
-
-		nm := task.Name
-		di.mu.RLock()
-		inCh, ok := di.ins[nm]
-		if !ok {
-			di.conf.Warn("unknown task", "name", nm)
-			if inCh, ok = di.ins[""]; ok {
-				nm = ""
-			}
-		}
-		di.mu.RUnlock()
-		if !ok {
-			if firstErr == nil {
-				di.conf.Error("unknown task", "name", nm, "task", task)
-				firstErr = fmt.Errorf("%w: %q (task=%q)", ErrUnknownCommand, nm, task.Name)
-			}
-			return errContinue
+		if nm != task.Name {
+			return fmt.Errorf("%w: wanted %q, got %q",
+				ErrUnknownCommand, nm, task.Name)
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case inCh <- task:
+			keepTask = true
 			return nil
 		}
 	}
 
 	grp, grpCtx := errgroup.WithContext(ctx)
-	for nm, Q := range di.getQs {
+	grp.SetLimit(di.conf.Concurrency)
+	for nm := range di.getQs {
+		nm := nm
 		grp.Go(func() error {
 			logger := di.conf.Logger.With(slog.String("queue", nm))
-			msgs := make([]godror.Message, di.conf.Concurrency)
+			Q, msgs := di.getQs[nm], di.deqMsgs[nm]
 			n, err := Q.Dequeue(msgs)
 			if err != nil {
 				logger.Error("dequeue", "error", err)
@@ -441,23 +434,12 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 			if n == 0 {
 				return nil
 			}
-			inCh := di.ins[nm]
-			if inCh == nil {
-				di.mu.Lock()
-				if inCh = di.ins[nm]; inCh == nil {
-					inCh = make(chan *Task)
-					di.ins[nm] = inCh
-				}
-				di.mu.Unlock()
-			}
-
 			ctx, cancel := context.WithTimeout(grpCtx, di.conf.Timeout)
 			defer cancel()
+			inCh := di.ins[nm]
 			for i := range msgs[:n] {
-				task := taskPool.Acquire()
-				if err := one(ctx, task, &msgs[i]); err != nil {
-					logger.Error("one", "task", task, "error", err)
-					taskPool.Release(task)
+				if err := one(ctx, nm, inCh, &msgs[i]); err != nil {
+					logger.Error("one", "error", err)
 					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 						return nil
 					}
