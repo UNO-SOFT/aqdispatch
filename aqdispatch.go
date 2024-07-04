@@ -115,45 +115,52 @@ func New(
 		do:      do,
 		ins:     make(map[string]chan *Task, len(taskNames)),
 		gates:   make(map[string]chan struct{}, len(taskNames)),
-		getQs:   make(map[string]*godror.Queue, len(taskNames)),
+		getQs:   make(map[string]queue, len(taskNames)),
 		datas:   make(chan *godror.Data, conf.Concurrency),
 		buffers: make(chan *bytes.Buffer, conf.Concurrency),
 		deqMsgs: make(map[string][]godror.Message, len(taskNames))}
 
 	ctx := context.Background()
-	getCx, err := db.Conn(dbCtx(ctx, "aqdispatch", inQName))
-	if err != nil {
-		di.Close()
-		return nil, err
-	}
-	di.getCx = getCx
+	if err := func() error {
+		cx, err := db.Conn(dbCtx(ctx, "aqdispatch", inQName))
+		if err != nil {
+			return err
+		}
+		defer cx.Close()
 
-	if err = godror.Raw(ctx, getCx, func(conn godror.Conn) error {
-		di.Timezone = conn.Timezone()
-		return nil
-	}); err != nil {
-		di.Close()
-		return nil, err
-	}
-	{
-		getQ, err := godror.NewQueue(ctx, getCx, inQName, inQType)
+		if err = godror.Raw(ctx, cx, func(conn godror.Conn) error {
+			di.Timezone = conn.Timezone()
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		getQ, err := godror.NewQueue(ctx, cx, inQName, inQType)
 		if err != nil {
 			di.Close()
-			return nil, err
+			return err
 		}
+		defer getQ.Close()
 		di.conf.Info("getQ", "name", getQ.Name())
 		if err = getQ.PurgeExpired(ctx); err != nil {
 			di.conf.Warn("PurgeExpired", "queue", getQ.Name(), "error", err)
 		}
 		_, di.getQHasBlob = getQ.PayloadObjectType.Attributes[di.conf.RequestKeyBlob]
-		getQ.Close()
+		return nil
+	}(); err != nil {
+		di.Close()
+		return nil, err
 	}
 
 	for _, nm := range taskNames {
 		var getQ *godror.Queue
+		var cx *sql.Conn
 		if err := func() error {
 			var err error
-			getQ, err = godror.NewQueue(ctx, getCx, inQName, inQType)
+			if cx, err = db.Conn(dbCtx(ctx, "aqdispatch-"+nm, inQName)); err != nil {
+				return err
+			}
+			getQ, err = godror.NewQueue(ctx, cx, inQName, inQType)
 			if err != nil {
 				return err
 			}
@@ -165,8 +172,8 @@ func New(
 			dOpts.Mode = godror.DeqRemove
 			dOpts.Navigation = godror.NavFirst
 			dOpts.Visibility = godror.VisibleImmediate
-			// dOpts.Wait = di.conf.PipeTimeout
-			dOpts.Wait = 100 * time.Millisecond
+			dOpts.Wait = di.conf.PipeTimeout
+			// dOpts.Wait = 100 * time.Millisecond
 			// dOpts.Correlation = di.conf.Correlation
 			dOpts.Condition = "tab.user_data." + di.conf.RequestKeyName +
 				"=UTL_i18n.raw_to_char(UTL_ENCODE.BASE64_DECODE(UTL_RAW.cast_to_raw('" +
@@ -179,10 +186,13 @@ func New(
 			if getQ != nil {
 				getQ.Close()
 			}
+			if cx != nil {
+				cx.Close()
+			}
 			di.Close()
 			return nil, err
 		}
-		di.getQs[nm] = getQ
+		di.getQs[nm] = queue{cx: cx, Queue: getQ}
 		di.deqMsgs[nm] = make([]godror.Message, conf.Concurrency)
 		di.ins[nm] = make(chan *Task)
 	}
@@ -231,7 +241,7 @@ func New(
 func (di *Dispatcher) PurgeExpired(ctx context.Context) error {
 	var firstErr error
 	for _, q := range di.getQs {
-		if q != nil {
+		if q.Queue != nil {
 			if err := q.PurgeExpired(ctx); err != nil && firstErr != nil {
 				firstErr = err
 			}
@@ -289,19 +299,34 @@ func (di *Dispatcher) Run(ctx context.Context) error {
 	}
 }
 
+type queue struct {
+	*godror.Queue
+	cx *sql.Conn
+}
+
+func (q queue) Close() error {
+	if q.Queue != nil {
+		q.Queue.Close()
+	}
+	if q.cx != nil {
+		q.cx.Close()
+	}
+	return nil
+}
+
 // Dispatcher. After creating with New, run it with Run.
 //
 // Reads tasks and store the messages in diskqueues - one for each distinct NAME.
 // If Concurrency allows, calls the do function given in New,
 // and sends the answer as PAYLOAD of what that writes as response.
 type Dispatcher struct {
-	getCx, putCx             io.Closer
+	putCx                    io.Closer
 	putConn                  godror.Conn
 	deqMsgs                  map[string][]godror.Message
 	gates                    map[string]chan struct{}
 	putObjects               chan *godror.Object
 	ins                      map[string]chan *Task
-	getQs                    map[string]*godror.Queue
+	getQs                    map[string]queue
 	putQ                     *godror.Queue
 	datas                    chan *godror.Data
 	do                       DoFunc
@@ -349,20 +374,15 @@ func (di *Dispatcher) Close() error {
 		}
 	}
 	for _, q := range getQs {
-		if q != nil {
-			q.Close()
-		}
+		q.Close()
 	}
 	if putQ != nil {
 		putQ.Close()
 	}
-	getCx, putCx := di.getCx, di.putCx
-	di.getCx, di.putCx = nil, nil
+	putCx := di.putCx
+	di.putCx = nil
 	if putCx != nil {
 		putCx.Close()
-	}
-	if getCx != nil {
-		getCx.Close()
 	}
 	return nil
 }
