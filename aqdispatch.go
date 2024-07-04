@@ -135,26 +135,28 @@ func New(
 		di.Close()
 		return nil, err
 	}
-	getQ, err := godror.NewQueue(ctx, getCx, inQName, inQType)
-	if err != nil {
-		di.Close()
-		return nil, err
+	{
+		getQ, err := godror.NewQueue(ctx, getCx, inQName, inQType)
+		if err != nil {
+			di.Close()
+			return nil, err
+		}
+		di.conf.Info("getQ", "name", getQ.Name())
+		if err = getQ.PurgeExpired(ctx); err != nil {
+			di.conf.Warn("PurgeExpired", "queue", getQ.Name(), "error", err)
+		}
+		_, di.getQHasBlob = getQ.PayloadObjectType.Attributes[di.conf.RequestKeyBlob]
+		getQ.Close()
 	}
-	di.conf.Info("getQ", "name", getQ.Name())
-	if err = getQ.PurgeExpired(ctx); err != nil {
-		di.conf.Warn("PurgeExpired", "queue", getQ.Name(), "error", err)
-	}
-	_, di.getQHasBlob = getQ.PayloadObjectType.Attributes[di.conf.RequestKeyBlob]
-	getQ.Close()
 
 	for _, nm := range taskNames {
+		var getQ *godror.Queue
 		if err := func() error {
 			var err error
 			getQ, err = godror.NewQueue(ctx, getCx, inQName, inQType)
 			if err != nil {
 				return err
 			}
-			defer getQ.Close()
 			di.conf.Info("getQ", "name", getQ.Name())
 			dOpts, err := getQ.DeqOptions()
 			if err != nil {
@@ -164,6 +166,7 @@ func New(
 			dOpts.Navigation = godror.NavFirst
 			dOpts.Visibility = godror.VisibleImmediate
 			dOpts.Wait = di.conf.PipeTimeout
+			// dOpts.Wait = 100 * time.Millisecond
 			dOpts.Correlation = di.conf.Correlation
 			dOpts.Condition = "tab.user_data." + di.conf.RequestKeyName +
 				"=UTL_i18n.raw_to_char(UTL_ENCODE.BASE64_DECODE('" +
@@ -172,6 +175,9 @@ func New(
 			dOpts.Consumer = nm
 			return getQ.SetDeqOptions(dOpts)
 		}(); err != nil {
+			if getQ != nil {
+				getQ.Close()
+			}
 			di.Close()
 			return nil, err
 		}
@@ -423,6 +429,7 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 	for nm := range di.getQs {
 		nm := nm
 		grp.Go(func() error {
+			// if err := func() error {
 			logger := di.conf.Logger.With(slog.String("queue", nm))
 			Q, msgs := di.getQs[nm], di.deqMsgs[nm]
 			n, err := Q.Dequeue(msgs)
@@ -449,12 +456,13 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 				}
 			}
 			return nil
+			// }(); err != nil && firstErr == nil {
+			// firstErr = err
+			// }
 		})
 	}
-	if err := grp.Wait(); err != nil {
-		if firstErr == nil {
-			firstErr = err
-		}
+	if err := grp.Wait(); err != nil && firstErr == nil {
+		firstErr = err
 	}
 	if firstErr != nil {
 		di.conf.Error("batch", "error", firstErr)
