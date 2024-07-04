@@ -165,14 +165,15 @@ func New(
 			dOpts.Mode = godror.DeqRemove
 			dOpts.Navigation = godror.NavFirst
 			dOpts.Visibility = godror.VisibleImmediate
-			dOpts.Wait = di.conf.PipeTimeout
-			// dOpts.Wait = 100 * time.Millisecond
-			dOpts.Correlation = di.conf.Correlation
+			// dOpts.Wait = di.conf.PipeTimeout
+			dOpts.Wait = 100 * time.Millisecond
+			// dOpts.Correlation = di.conf.Correlation
 			dOpts.Condition = "tab.user_data." + di.conf.RequestKeyName +
-				"=UTL_i18n.raw_to_char(UTL_ENCODE.BASE64_DECODE('" +
+				"=UTL_i18n.raw_to_char(UTL_ENCODE.BASE64_DECODE(UTL_RAW.cast_to_raw('" +
 				base64.StdEncoding.EncodeToString([]byte(nm)) +
-				"'), 'AL32UTF8')"
-			dOpts.Consumer = nm
+				"')), 'AL32UTF8')"
+			// dOpts.Consumer MUST NOT be set (ORA-24039).
+			di.conf.Debug("SetDeqOptions", "queue", nm, "options", dOpts)
 			return getQ.SetDeqOptions(dOpts)
 		}(); err != nil {
 			if getQ != nil {
@@ -432,12 +433,13 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 			// if err := func() error {
 			logger := di.conf.Logger.With(slog.String("queue", nm))
 			Q, msgs := di.getQs[nm], di.deqMsgs[nm]
+			logger.Debug("start dequeue", slog.Int("msgs", len(msgs)))
 			n, err := Q.Dequeue(msgs)
 			if err != nil {
 				logger.Error("dequeue", "error", err)
 				return err
 			}
-			logger.Debug("dequeue", "n", n)
+			logger.Info("dequeue", "n", n)
 			if n == 0 {
 				return nil
 			}
