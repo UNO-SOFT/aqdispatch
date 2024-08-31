@@ -484,21 +484,37 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, conf.Timeout)
-	defer cancel()
 	for i := range msgs {
-		task := taskPool.Acquire()
-		if err := one(ctx, task, &msgs[i]); err != nil {
-			conf.Error("one", "task", task, "error", err)
-			taskPool.Release(task)
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return nil
-			}
-			if !errors.Is(err, errContinue) {
+		if err := func() error {
+			if err := ctx.Err(); err != nil {
 				return err
+			}
+			ctx, cancel := context.WithTimeout(ctx, conf.Timeout)
+			defer cancel()
+
+			task := taskPool.Acquire()
+			defer taskPool.Release(task)
+			err := one(ctx, task, &msgs[i])
+			if err != nil {
+				lvl := slog.LevelError
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					lvl = slog.LevelInfo
+				} else if !errors.Is(err, errContinue) {
+					lvl = slog.LevelWarn
+				}
+				conf.Log(ctx, lvl, "one", "task", task, "error", err)
+				if lvl != slog.LevelError {
+					err = nil
+				}
+			}
+			return err
+		}(); err != nil {
+			if firstErr == nil {
+				firstErr = err
 			}
 		}
 	}
+
 	if firstErr != nil {
 		conf.Error("batch", "error", err)
 	}
