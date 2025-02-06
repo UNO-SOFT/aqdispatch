@@ -75,7 +75,7 @@ type Config struct {
 //type Task = pb.Task
 
 // DoFunc is the type of the function that processes the Task.
-type DoFunc func(context.Context, io.Writer, *Task) (io.Reader, error)
+type DoFunc func(context.Context, io.Writer, Task) (io.Reader, error)
 
 // New returns a new Dispatcher, which receives inQType typed messages on inQName.
 //
@@ -156,7 +156,7 @@ func New(
 	di := Dispatcher{
 		conf:    conf,
 		do:      do,
-		ins:     make(map[string]chan *Task, conf.QueueCount),
+		ins:     make(map[string]chan Task, conf.QueueCount),
 		diskQs:  make(map[string]diskqueue.Interface, conf.QueueCount),
 		gates:   make(map[string]chan struct{}, conf.QueueCount),
 		datas:   make(chan *godror.Data, conf.Concurrency),
@@ -317,7 +317,7 @@ type Dispatcher struct {
 	gates                    map[string]chan struct{}
 	putObjects               chan *godror.Object
 	getQ                     *godror.Queue
-	ins                      map[string]chan *Task
+	ins                      map[string]chan Task
 	diskQs                   map[string]diskqueue.Interface
 	putQ                     *godror.Queue
 	datas                    chan *godror.Data
@@ -399,7 +399,6 @@ var (
 	errChannelClosed = errors.New("channel is closed")
 	errContinue      = errors.New("continue")
 )
-var taskPool = tskPool{pool: &sync.Pool{New: func() interface{} { var t Task; return &t }}}
 
 // batch process at most Config.Concurrency number of messages: wait at max Config.Timeout,
 // then for each message, decode it, send to the named channel if possible,
@@ -430,10 +429,10 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 
 	var b []byte
 	var firstErr error
-	one := func(ctx context.Context, task *Task, msg *godror.Message) error {
+	one := func(ctx context.Context, task Task, msg *godror.Message) error {
 		// The messages are tightly coupled with the queue,
 		// so we must parse them sequentially.
-		err = di.parse(ctx, task, msg)
+		err = di.parse(ctx, &task, msg)
 		if err != nil {
 			conf.Warn("parse", "error", err)
 			if errors.Is(err, ErrEmpty) {
@@ -444,6 +443,7 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 			}
 			return errContinue
 		}
+		conf.Debug("parsed", "task", task)
 
 		nm := task.Name
 		di.mu.RLock()
@@ -503,8 +503,9 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 			ctx, cancel := context.WithTimeout(ctx, conf.Timeout)
 			defer cancel()
 
-			task := taskPool.Acquire()
-			defer taskPool.Release(task)
+			// task := taskPool.Acquire()
+			// defer taskPool.Release(task)
+			var task Task
 			err := one(ctx, task, &msgs[i])
 			if err != nil {
 				lvl := slog.LevelError
@@ -517,6 +518,8 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 				if lvl != slog.LevelError {
 					err = nil
 				}
+			} else {
+				conf.Info("received", "task", task)
 			}
 			return err
 		}(); err != nil {
@@ -549,7 +552,7 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 		di.mu.Lock()
 		inCh, gate, q = di.ins[nm], di.gates[nm], di.diskQs[nm]
 		if inCh == nil {
-			inCh = make(chan *Task)
+			inCh = make(chan Task)
 			di.ins[nm] = inCh
 		}
 		if gate == nil {
@@ -576,13 +579,15 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 		}
 		di.mu.Unlock()
 	}
+
 	one := func() error {
 		var qCh <-chan []byte
 		if q != nil {
 			qCh = q.ReadChan()
 		}
-		var task *Task
+		var task Task
 		var ok bool
+		var source string
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -590,24 +595,31 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 			if !ok {
 				return fmt.Errorf("%q: %w", nm, errChannelClosed)
 			}
+			source = "inCh[" + nm + "]"
 			// fast path
 		case b, ok := <-qCh:
 			if !ok {
 				return nil
 			}
-			task = taskPool.Acquire()
+			// task = taskPool.Acquire()
 			if err := task.UnmarshalProtobuf(b); err != nil {
 				di.conf.Error("unmarshal", "bytes", b, "error", err)
 				return errContinue
 			}
+			source = "qCh[" + nm + "]"
 		}
-		di.conf.Debug("consume", "task", task)
-		if task == nil {
+		di.conf.Info("consume", "task", task, "source", source)
+		di.conf.Info("task0", "task", task)
+		if task.IsZero() {
 			return errContinue
 		}
+
+		di.conf.Info("task1", "task", task)
+		logger := di.conf.With(slog.String("name", task.Name), slog.String("refID", task.RefID))
+		logger.Info("task2", "task", task)
 		if task.Name == "" {
-			di.conf.Info("empty task", "task", task)
-			taskPool.Release(task)
+			logger.Info("empty task", "task", task, "source", source)
+			// taskPool.Release(task)
 			return errContinue
 		}
 		//var deadline time.Time
@@ -618,28 +630,34 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 			deadline = time.Now().Add(di.conf.Timeout)
 		}
 		if !deadline.After(time.Now()) {
-			di.conf.Info("skip overtime", "deadline", deadline, "refID", task.RefID)
+			logger.Info("skip overtime", slog.Time("deadline", deadline), slog.String("refID", task.RefID))
 			if task.RefID != "" {
 				_ = di.answer(task.RefID, nil, nil, context.DeadlineExceeded)
 			}
-			taskPool.Release(task)
+			// taskPool.Release(task)
 			return nil
 		}
-		name := task.Name
-		di.conf.Info("begin", "task", name, "deadline", deadline, "payloadLen", len(task.Payload), "blobsCount", len(task.Blobs))
+
+		logger.Info("begin", slog.Time("deadline", deadline),
+			slog.Int("payloadLen", len(task.Payload)),
+			slog.Int("blobsCount", len(task.Blobs)))
 		select {
 		case <-ctx.Done():
+			di.conf.Warn("context done", "error", ctx.Err())
 			return ctx.Err()
 		case gate <- struct{}{}:
 			// Execute on a separate goroutine
 			go func() {
-				defer func() { <-gate; taskPool.Release(task) }()
+				defer func() { <-gate }() //; taskPool.Release(task) }()
+				logger.Debug("execute")
 				di.execute(ctx, task)
-				di.conf.Info("end", "task", name, "deadline", deadline)
+				logger.Info("end", slog.Time("deadline", deadline),
+					slog.String("source", source))
 			}()
 		}
 		return nil
 	}
+
 	for {
 		if err := one(); err == nil ||
 			errors.Is(err, context.DeadlineExceeded) ||
@@ -746,9 +764,12 @@ func (di *Dispatcher) parse(ctx context.Context, task *Task, msg *godror.Message
 		}
 	}
 
-	logger.Info("parse", "name", task.Name, "payloadLen", len(task.Payload), "blobCount", len(task.Blobs),
-		"enqueued", msg.Enqueued, "delay", msg.Delay.String(), "expiry", msg.Expiration.String(),
-		"deadline", deadline)
+	logger.Info("parse",
+		slog.String("name", task.Name), slog.String("refID", task.RefID),
+		slog.Int("payloadLen", len(task.Payload)), slog.Int("blobCount", len(task.Blobs)),
+		slog.Time("enqueued", msg.Enqueued), slog.Time("deadline", deadline),
+		slog.Duration("delay", msg.Delay), slog.Duration("expiry", msg.Expiration),
+	)
 	if task.RefID == "" || task.Name == "" {
 		return ErrEmpty
 	}
@@ -757,7 +778,7 @@ func (di *Dispatcher) parse(ctx context.Context, task *Task, msg *godror.Message
 }
 
 // execute calls do on the task, then calls answer with the answer.
-func (di *Dispatcher) execute(ctx context.Context, task *Task) {
+func (di *Dispatcher) execute(ctx context.Context, task Task) {
 	di.conf.Debug("execute", "task", task)
 	if task.RefID == "" || task.Name == "" {
 		di.conf.Info("execute skip empty task", "task", task)
@@ -917,16 +938,4 @@ Loop:
 
 func dbCtx(ctx context.Context, module, action string) context.Context {
 	return godror.ContextWithTraceTag(ctx, godror.TraceTag{Module: module, Action: action})
-}
-
-type tskPool struct {
-	pool *sync.Pool
-}
-
-func (p tskPool) Acquire() *Task { return p.pool.Get().(*Task) }
-func (p tskPool) Release(t *Task) {
-	if t != nil {
-		*t = Task{}
-		p.pool.Put(t)
-	}
 }

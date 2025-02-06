@@ -16,6 +16,9 @@ type Task struct {
 	Payload  []byte    `protobuf:"bytes,5,opt,name=Payload,proto3" json:"Payload,omitempty"`
 	Blobs    []*Blob   `protobuf:"bytes,6,rep,name=Blobs,proto3" json:"Blobs,omitempty"`
 }
+
+func (t Task) IsZero() bool { return t.Name == "" }
+
 type Timestamp struct {
 	// seconds	int64	Represents seconds of UTC time since Unix epoch 1970-01-01T00:00:00Z. Must be from 0001-01-01T00:00:00Z to 9999-12-31T23:59:59Z inclusive.
 	Seconds int64 `protobuf:"int64,1,opt,name=Seconds,proto3"`
