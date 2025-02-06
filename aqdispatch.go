@@ -392,6 +392,7 @@ var (
 	ErrEmpty          = errors.New("empty")
 	ErrExit           = errors.New("exit")
 	ErrAnswer         = errors.New("answer send error")
+	ErrBadSetup       = errors.New("bad setup")
 
 	errChannelClosed = errors.New("channel is closed")
 	errContinue      = errors.New("continue")
@@ -413,6 +414,10 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 	n, err := di.getQ.Dequeue(msgs)
 	if err != nil {
 		conf.Error("dequeue", "error", err)
+		var ec interface{ Code() int }
+		if errors.As(err, &ec) && ec.Code() == 1031 { // insufficient privileges
+			err = fmt.Errorf("%w: %w", ErrBadSetup, err)
+		}
 		return err
 	}
 	conf.Debug("dequeue", "n", n)
@@ -477,6 +482,10 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 			conf.Info("enqueue", "task", task.Name, "deadline", task.Deadline) //task.GetDeadline().AsTime())
 			if err = q.Put(b); err != nil {
 				conf.Error("enqueue", "queue", task.Name, "error", err)
+				var ec interface{ Code() int }
+				if errors.As(err, &ec) && ec.Code() == 1031 { // insufficient privileges
+					err = fmt.Errorf("%w: %w", ErrBadSetup, err)
+				}
 				return fmt.Errorf("put surplus task into %q queue: %w", task.Name, err)
 			}
 			return errContinue // release Task

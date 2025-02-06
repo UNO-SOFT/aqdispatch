@@ -59,14 +59,9 @@ func timeMarshalProtobuf(mm *easyproto.MessageMarshaler, t time.Time) {
 	mm.AppendInt32(2, int32(t.Nanosecond()))
 }
 
-func newTimestamp(t time.Time) Timestamp {
-	return Timestamp{Seconds: t.Unix(), Nanos: int32(t.Nanosecond())}
-}
+// func newTimestamp(t time.Time) Timestamp { return Timestamp{Seconds: t.Unix(), Nanos: int32(t.Nanosecond())} }
 
-func (ts Timestamp) marshalProtobuf(mm *easyproto.MessageMarshaler) {
-	mm.AppendInt64(1, ts.Seconds)
-	mm.AppendInt32(2, ts.Nanos)
-}
+// func (ts Timestamp) marshalProtobuf(mm *easyproto.MessageMarshaler) { mm.AppendInt64(1, ts.Seconds); mm.AppendInt32(2, ts.Nanos) }
 
 func (b Blob) marshalProtobuf(mm *easyproto.MessageMarshaler) {
 	mm.AppendBytes(1, b.Bytes)
