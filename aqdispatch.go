@@ -275,6 +275,8 @@ func (di *Dispatcher) Run(ctx context.Context, taskNames []string) error {
 		if err := di.batch(ctx); err != nil {
 			if err == io.EOF {
 				continue
+			} else if errors.Is(err, ErrBadSetup) {
+				return err
 			}
 			var ec interface{ Code() int }
 			di.conf.Error("batch finished", "error", err)
