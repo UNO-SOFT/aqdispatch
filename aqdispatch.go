@@ -601,7 +601,6 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 			if !ok {
 				return nil
 			}
-			// task = taskPool.Acquire()
 			if err := task.UnmarshalProtobuf(b); err != nil {
 				di.conf.Error("unmarshal", "bytes", b, "error", err)
 				return errContinue
@@ -609,22 +608,15 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 			source = "qCh[" + nm + "]"
 		}
 		di.conf.Info("consume", "task", task, "source", source)
-		// di.conf.Info("task0", "task", task)
 		if task.IsZero() {
 			return errContinue
 		}
 
-		// di.conf.Info("task1", "task", task)
 		logger := di.conf.With(slog.String("name", task.Name), slog.String("refID", task.RefID))
-		// logger.Info("task2", "task", task)
 		if task.Name == "" {
 			logger.Info("empty task", "task", task, "source", source)
-			// taskPool.Release(task)
 			return errContinue
 		}
-		//var deadline time.Time
-		//if dl := task.GetDeadline(); dl.IsValid() {
-		//	deadline = dl.AsTime()
 		deadline := task.Deadline
 		if deadline.IsZero() {
 			deadline = time.Now().Add(di.conf.Timeout)
