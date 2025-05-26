@@ -5,6 +5,7 @@ go 1.23.0
 toolchain go1.24.1
 
 require (
+	github.com/UNO-SOFT/zlog v0.8.1
 	github.com/VictoriaMetrics/easyproto v0.1.4
 	github.com/godror/godror v0.48.3
 	github.com/google/go-cmp v0.6.0
@@ -18,8 +19,9 @@ require (
 	github.com/go-logfmt/logfmt v0.6.0 // indirect
 	github.com/go-logr/logr v1.4.2 // indirect
 	github.com/godror/knownpb v0.3.0 // indirect
-	github.com/planetscale/vtprotobuf v0.6.0 // indirect
 	golang.org/x/exp v0.0.0-20250506013437-ce4c2cf36ca6 // indirect
+	golang.org/x/sys v0.22.0 // indirect
+	golang.org/x/term v0.10.0 // indirect
 )
 
 retract v0.3.5

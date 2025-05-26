@@ -153,6 +153,9 @@ func New(
 	if outQName != "" && outQType == "" || outQName == "" && outQType != "" {
 		return nil, errors.New("outQName, outQType are required")
 	}
+	if conf.Logger == nil {
+		conf.Logger = slog.New(slog.DiscardHandler)
+	}
 	di := Dispatcher{
 		conf:    conf,
 		do:      do,
