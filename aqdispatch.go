@@ -512,7 +512,7 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 			err := one(ctx, task, &msgs[i])
 			if err != nil {
 				lvl := slog.LevelError
-				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, errContinue) {
 					lvl = slog.LevelInfo
 				} else if !errors.Is(err, errContinue) {
 					lvl = slog.LevelWarn
@@ -533,7 +533,7 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 	}
 
 	if firstErr != nil {
-		conf.Error("batch", "error", err)
+		conf.Error("batch", "error", firstErr)
 	}
 	return firstErr
 }
