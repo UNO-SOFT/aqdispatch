@@ -453,18 +453,17 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 		di.mu.RLock()
 		inCh, ok := di.ins[nm]
 		if !ok {
-			conf.Warn("unknown task", "name", nm)
+			conf.Warn("unknown task", "name", nm, "task", task)
 			if inCh, ok = di.ins[""]; ok {
 				nm = ""
+			}
+			if firstErr == nil {
+				firstErr = fmt.Errorf("%w: %q (task=%q)", ErrUnknownCommand, nm, task.Name)
 			}
 		}
 		q := di.diskQs[nm]
 		di.mu.RUnlock()
-		if !ok {
-			if firstErr == nil {
-				conf.Error("unknown task", "name", nm, "task", task)
-				firstErr = fmt.Errorf("%w: %q (task=%q)", ErrUnknownCommand, nm, task.Name)
-			}
+		if !ok { // unknown task
 			return errContinue
 		}
 		if q == nil {
@@ -494,7 +493,6 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 				}
 				return fmt.Errorf("put surplus task into %q queue: %w", task.Name, err)
 			}
-			return errContinue // release Task
 		}
 		return nil
 	}
@@ -507,21 +505,21 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 			ctx, cancel := context.WithTimeout(ctx, conf.Timeout)
 			defer cancel()
 
-			// task := taskPool.Acquire()
-			// defer taskPool.Release(task)
 			var task Task
 			err := one(ctx, task, &msgs[i])
 			if err != nil {
 				lvl := slog.LevelError
-				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, errContinue) {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					lvl = slog.LevelInfo
-				} else if !errors.Is(err, errContinue) {
+				} else if errors.Is(err, errContinue) {
 					lvl = slog.LevelWarn
 				}
 				conf.Log(ctx, lvl, "one", "task", task, "error", err)
 				if lvl != slog.LevelError {
 					err = nil
 				}
+			} else if task.IsZero() {
+				conf.Error("received empty task")
 			} else {
 				conf.Info("received", "task", task)
 			}
