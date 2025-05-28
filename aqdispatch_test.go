@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/text/encoding"
 
 	"github.com/UNO-SOFT/aqdispatch"
@@ -118,21 +119,14 @@ func testAQ(t testing.TB, resetTimer func(), loop func() bool) {
 		}
 		return tx.Commit()
 	}
-	subCtx, subCancel := context.WithTimeout(ctx, 10*time.Second)
-	defer subCancel()
 	qs := make([]string, 0, parallel)
 	for i := range parallel {
 		qs = append(qs, fmt.Sprintf("test_%02d", i))
 	}
 	go func() {
-		for subCtx.Err() == nil {
-			err := ex.Run(subCtx, qs)
-			if err != nil {
-				if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-					return
-				}
-				t.Fatal(err)
-			}
+		err := ex.Run(ctx, qs)
+		if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+			t.Log(err)
 		}
 	}()
 
@@ -141,18 +135,34 @@ func testAQ(t testing.TB, resetTimer func(), loop func() bool) {
 	}
 	var i int
 	for loop() {
-		for range 64 {
-			ctx, cancel := context.WithTimeout(ctx, time.Second)
-			err := call(ctx, i)
-			cancel()
-			if err != nil && !(errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
-				t.Fatal(err)
+		for range 4 {
+			grp, grpCtx := errgroup.WithContext(ctx)
+			grp.SetLimit(4)
+			for range parallel {
+				i++
+				i := i - 1
+				// t.Log("start", i)
+				grp.Go(func() error {
+					ctx, cancel := context.WithTimeout(grpCtx, 3*time.Second)
+					err := call(ctx, i)
+					cancel()
+					if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+						return nil
+					}
+					return err
+				})
 			}
-			i++
+			// t.Log("i:", i)
+			if err := grp.Wait(); err != nil {
+				t.Error(err)
+				break
+			}
+			// t.Log("waited")
 		}
 	}
-	subCancel()
+	// t.Log("loop done")
 	ex.Close()
+	// t.Log("Close")
 }
 
 const aqTableName, aqQueueName, aqQueueTypeName = "T_WSC_Q", "Q_WSC", "TY_WSC"

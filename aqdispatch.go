@@ -264,6 +264,7 @@ func (di *Dispatcher) PurgeExpired(ctx context.Context) error {
 
 // Run the dispatcher, accepting tasks with names in taskNames.
 func (di *Dispatcher) Run(ctx context.Context, taskNames []string) error {
+	defer func() { di.conf.Info("Run finished") }()
 	grp, ctx := errgroup.WithContext(ctx)
 	for _, nm := range taskNames {
 		nm := nm
