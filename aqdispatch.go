@@ -1,4 +1,4 @@
-// Copyright 2021, 2024 Tamás Gulácsi. All rights reserved.
+// Copyright 2021, 2025 Tamás Gulácsi. All rights reserved.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -416,19 +416,8 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 	di.mu.RLock()
 	msgs, conf := di.deqMsgs[:], di.conf
 	di.mu.RUnlock()
-	n, err := di.getQ.Dequeue(msgs)
-	if err != nil {
-		conf.Error("dequeue", "error", err)
-		var ec interface{ Code() int }
-		if errors.As(err, &ec) && ec.Code() == 1031 { // insufficient privileges
-			err = fmt.Errorf("%w: %w", ErrBadSetup, err)
-		}
-		return err
-	}
-	conf.Debug("dequeue", "n", n)
-	if n == 0 {
-		return nil
-	}
+	n, deqErr := di.getQ.Dequeue(msgs)
+	conf.Debug("dequeue", "n", n, "error", deqErr)
 	msgs = msgs[:n]
 
 	var b []byte
@@ -436,16 +425,15 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 	one := func(ctx context.Context, task Task, msg *godror.Message) error {
 		// The messages are tightly coupled with the queue,
 		// so we must parse them sequentially.
-		err = di.parse(ctx, &task, msg)
+		err := di.parse(ctx, &task, msg)
 		if err != nil {
 			conf.Warn("parse", "error", err)
 			if errors.Is(err, ErrEmpty) {
-				return errContinue
+				return fmt.Errorf("%w: %w", errContinue, err)
 			}
-			if firstErr == nil {
-				firstErr = err
-			}
-			return errContinue
+			return fmt.Errorf("%w: parse: %w", errContinue, err)
+		} else if task.IsZero() {
+			panic("zero task no error")
 		}
 		conf.Debug("parsed", "task", task)
 
@@ -456,15 +444,15 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 			conf.Warn("unknown task", "name", nm, "task", task)
 			if inCh, ok = di.ins[""]; ok {
 				nm = ""
-			}
-			if firstErr == nil {
-				firstErr = fmt.Errorf("%w: %q (task=%q)", ErrUnknownCommand, nm, task.Name)
+			} else {
+				return fmt.Errorf("%w: %w: %q (task=%q)",
+					errContinue, ErrUnknownCommand, nm, task.Name)
 			}
 		}
 		q := di.diskQs[nm]
 		di.mu.RUnlock()
 		if !ok { // unknown task
-			return errContinue
+			return fmt.Errorf("%w: unknown task (%s)", errContinue, nm)
 		}
 		if q == nil {
 			// Skip the disk queue, wait for the channel
@@ -533,8 +521,16 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 
 	if firstErr != nil {
 		conf.Error("batch", "error", firstErr)
+		return firstErr
+	} else if deqErr != nil {
+		conf.Error("dequeue", "error", deqErr)
+		var ec interface{ Code() int }
+		if errors.As(deqErr, &ec) && ec.Code() == 1031 { // insufficient privileges
+			deqErr = fmt.Errorf("%w: %w", ErrBadSetup, deqErr)
+		}
+		return deqErr
 	}
-	return firstErr
+	return nil
 }
 
 // consume the named queue. Does not return.
@@ -674,10 +670,8 @@ func (di *Dispatcher) parse(ctx context.Context, task *Task, msg *godror.Message
 			}
 		}()
 	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	var data *godror.Data
 	select {
@@ -757,8 +751,12 @@ func (di *Dispatcher) parse(ctx context.Context, task *Task, msg *godror.Message
 			}
 		}
 	}
+	lvl := slog.LevelInfo
+	if task.Name == "" {
+		lvl = slog.LevelWarn
+	}
 
-	logger.Info("parse",
+	logger.Log(ctx, lvl, "parse",
 		slog.String("name", task.Name), slog.String("refID", task.RefID),
 		slog.Int("payloadLen", len(task.Payload)), slog.Int("blobCount", len(task.Blobs)),
 		slog.Time("enqueued", msg.Enqueued), slog.Time("deadline", deadline),

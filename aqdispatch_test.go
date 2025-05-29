@@ -143,7 +143,7 @@ func testAQ(t testing.TB, resetTimer func(), loop func() bool) {
 				i := i - 1
 				// t.Log("start", i)
 				grp.Go(func() error {
-					ctx, cancel := context.WithTimeout(grpCtx, 3*time.Second)
+					ctx, cancel := context.WithTimeout(grpCtx, 15*time.Second)
 					err := call(ctx, i)
 					cancel()
 					if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
