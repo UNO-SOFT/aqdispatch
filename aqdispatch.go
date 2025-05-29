@@ -422,7 +422,8 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 
 	var b []byte
 	var firstErr error
-	one := func(ctx context.Context, task Task, msg *godror.Message) error {
+	one := func(ctx context.Context, msg *godror.Message) error {
+		var task Task
 		// The messages are tightly coupled with the queue,
 		// so we must parse them sequentially.
 		err := di.parse(ctx, &task, msg)
@@ -493,8 +494,7 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 			ctx, cancel := context.WithTimeout(ctx, conf.Timeout)
 			defer cancel()
 
-			var task Task
-			err := one(ctx, task, &msgs[i])
+			err := one(ctx, &msgs[i])
 			if err != nil {
 				lvl := slog.LevelError
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -502,14 +502,10 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 				} else if errors.Is(err, errContinue) {
 					lvl = slog.LevelWarn
 				}
-				conf.Log(ctx, lvl, "one", "task", task, "error", err)
+				conf.Log(ctx, lvl, "one", "error", err)
 				if lvl != slog.LevelError {
 					err = nil
 				}
-			} else if task.IsZero() {
-				conf.Error("received empty task")
-			} else {
-				conf.Info("received", "task", task)
 			}
 			return err
 		}(); err != nil {
