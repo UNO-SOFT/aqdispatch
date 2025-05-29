@@ -139,7 +139,7 @@ func New(
 		conf.PipeTimeout = 30 * time.Second
 	}
 	if conf.Concurrency <= 0 {
-		conf.Concurrency = runtime.GOMAXPROCS(-1)
+		conf.Concurrency = runtime.GOMAXPROCS(-1) * 16
 	}
 	if conf.QueueCount <= 0 {
 		conf.QueueCount = 1
