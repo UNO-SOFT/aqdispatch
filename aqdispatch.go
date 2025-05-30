@@ -2,6 +2,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+// Package aqdispatch implements multiple queues over a single Oracle AQ.
+//
+// https://docs.oracle.com/en/database/oracle/oracle-database/21/adque/aq-introduction.html#GUID-4237239B-1603-4F10-9B41-4D527994FDFA
 package aqdispatch
 
 import (
@@ -182,12 +185,10 @@ func New(
 		di.Close()
 		return nil, err
 	}
-	getQ, err := godror.NewQueue(ctx, getCx, inQName, inQType)
-	if err != nil {
+	if di.getQ, err = godror.NewQueue(ctx, getCx, inQName, inQType); err != nil {
 		di.Close()
 		return nil, err
 	}
-	di.getQ = getQ
 	di.conf.Info("getQ", "name", di.getQ.Name())
 	if err = di.getQ.PurgeExpired(ctx); err != nil {
 		di.conf.Warn("PurgeExpired", "queue", di.getQ.Name(), "error", err)
@@ -197,7 +198,7 @@ func New(
 		di.Close()
 		return nil, err
 	}
-	dOpts.Mode = godror.DeqRemove
+	dOpts.Mode = godror.DeqBrowse
 	dOpts.Navigation = godror.NavFirst
 	dOpts.Visibility = godror.VisibleImmediate
 	dOpts.Wait = conf.PipeTimeout
@@ -206,7 +207,23 @@ func New(
 		di.Close()
 		return nil, err
 	}
-	_, di.getQHasBlob = getQ.PayloadObjectType.Attributes[di.conf.RequestKeyBlob]
+	_, di.getQHasBlob = di.getQ.PayloadObjectType.Attributes[di.conf.RequestKeyBlob]
+
+	if di.rmQ, err = godror.NewQueue(ctx, getCx, inQName, inQType); err != nil {
+		di.Close()
+		return nil, err
+	}
+	di.conf.Info("rmQ", "name", di.rmQ.Name())
+	rOpts, err := di.rmQ.DeqOptions()
+	if err != nil {
+		di.Close()
+		return nil, err
+	}
+	rOpts.Mode = godror.DeqPeek
+	rOpts.Navigation = godror.NavFirst
+	rOpts.Visibility = godror.VisibleImmediate
+	rOpts.Wait = 0
+	di.rOpts = rOpts
 
 	if outQName == "" {
 		return &di, nil
@@ -320,7 +337,8 @@ type Dispatcher struct {
 	putConn                  godror.Conn
 	gates                    map[string]chan struct{}
 	putObjects               chan *godror.Object
-	getQ                     *godror.Queue
+	getQ, rmQ                *godror.Queue
+	rOpts                    godror.DeqOptions
 	ins                      map[string]chan Task
 	diskQs                   map[string]diskqueue.Interface
 	putQ                     *godror.Queue
@@ -356,8 +374,8 @@ func (di *Dispatcher) Encode(s string) string {
 func (di *Dispatcher) Close() error {
 	di.mu.Lock()
 	defer di.mu.Unlock()
-	ins, putO, diskQs, getQ, putQ := di.ins, di.putObjects, di.diskQs, di.getQ, di.putQ
-	di.ins, di.putObjects, di.diskQs, di.getQ, di.putQ = nil, nil, nil, nil, nil
+	ins, putO, diskQs, getQ, rmQ, putQ := di.ins, di.putObjects, di.diskQs, di.getQ, di.rmQ, di.putQ
+	di.ins, di.putObjects, di.diskQs, di.getQ, di.rmQ, di.putQ = nil, nil, nil, nil, nil, nil
 	di.putConn = nil
 	for _, c := range ins {
 		close(c)
@@ -385,6 +403,9 @@ func (di *Dispatcher) Close() error {
 	}
 	if getQ != nil {
 		getQ.Close()
+	}
+	if rmQ != nil {
+		rmQ.Close()
 	}
 	if putQ != nil {
 		putQ.Close()
@@ -461,27 +482,42 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 			case <-ctx.Done():
 				return ctx.Err()
 			case inCh <- task:
-				return nil
+				// Success
+			}
+		} else {
+
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case inCh <- task:
+				// Success
+			default:
+				// diskQs are for traffic jams
+				b = MarshalProtobuf(b[:0], task)
+				conf.Info("enqueue", "task", task.Name, "deadline", task.Deadline) //task.GetDeadline().AsTime())
+				if err = q.Put(b); err != nil {
+					conf.Error("enqueue", "queue", task.Name, "error", err)
+					var ec interface{ Code() int }
+					if errors.As(err, &ec) && ec.Code() == 1031 { // insufficient privileges
+						err = fmt.Errorf("%w: %w", ErrBadSetup, err)
+					}
+					return fmt.Errorf("put surplus task into %q queue: %w", task.Name, err)
+				}
 			}
 		}
 
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case inCh <- task:
-			// Success
-		default:
-			// diskQs are for traffic jams
-			b = MarshalProtobuf(b[:0], task)
-			conf.Info("enqueue", "task", task.Name, "deadline", task.Deadline) //task.GetDeadline().AsTime())
-			if err = q.Put(b); err != nil {
-				conf.Error("enqueue", "queue", task.Name, "error", err)
-				var ec interface{ Code() int }
-				if errors.As(err, &ec) && ec.Code() == 1031 { // insufficient privileges
-					err = fmt.Errorf("%w: %w", ErrBadSetup, err)
-				}
-				return fmt.Errorf("put surplus task into %q queue: %w", task.Name, err)
-			}
+		// remove successfully processed message from queue
+		rOpts := di.rOpts
+		rOpts.MsgID = append(rOpts.MsgID[:0], msg.MsgID[:]...)
+		if err := di.rmQ.SetDeqOptions(rOpts); err != nil {
+			return err
+		}
+		conf.Debug("rm", "msgID", rOpts.MsgID)
+		msgs := make([]godror.Message, 1)
+		if n, err := di.rmQ.Dequeue(msgs); err != nil {
+			return err
+		} else if n == 0 {
+			conf.Warn("remove failed", "msgID", msg.MsgID)
 		}
 		return nil
 	}

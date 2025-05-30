@@ -13,11 +13,11 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sync"
+	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
-	"golang.org/x/sync/errgroup"
 	"golang.org/x/text/encoding"
 
 	"github.com/UNO-SOFT/aqdispatch"
@@ -33,7 +33,7 @@ var (
 	), "database to connect to")
 	flagSysConnect = flag.String("connect-sys", nvl(
 		os.Getenv("BRUNO_OWNER_ID"),
-		`system/system@localhost:1521/freepdb1 AS SYSDBA`,
+		`sys/system@localhost:1521/freepdb1 AS SYSDBA`,
 	), "database to connect to as SYSDBA")
 )
 
@@ -54,8 +54,6 @@ func BenchmarkAQ(b *testing.B) {
 type payload struct{ ID int }
 
 func testAQ(t testing.TB, resetTimer func(), loop func() bool) {
-	srvReceived := make(map[int]chan struct{})
-	var srvReceivedMu sync.Mutex
 	ctx, closer, db, ex := setupAQ(t, func(ctx context.Context, w io.Writer, task aqdispatch.Task) (io.Reader, error) {
 		if len(task.Payload) == 0 {
 			t.Errorf("got empty Task=%#v", task)
@@ -72,52 +70,35 @@ func testAQ(t testing.TB, resetTimer func(), loop func() bool) {
 			t.Errorf("zero ID in Task=%#v (%q)", task, string(task.Payload))
 			return nil, fmt.Errorf("zero ID (%q)", string(task.Payload))
 		}
-		srvReceivedMu.Lock()
-		ch := srvReceived[p.Payload.ID]
-		delete(srvReceived, p.Payload.ID)
-		srvReceivedMu.Unlock()
+		time.Sleep(time.Second) // Simulate a 1s execution time
 		answer := payload{ID: p.Payload.ID*2 + 1}
-		select {
-		case ch <- struct{}{}:
-		default:
-		}
 		return nil, json.NewEncoder(w).Encode(answer)
 	})
 	defer closer()
+	logger := zlog.SFromContext(ctx)
 
 	const parallel = 64
 
-	call := func(ctx context.Context, i int) error {
-		tx, err := db.BeginTx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-		ch := make(chan struct{}, 1)
-		srvReceivedMu.Lock()
-		srvReceived[i+1] = ch
-		srvReceivedMu.Unlock()
+	put := func(ctx context.Context, tx *sql.Tx, i int) (string, error) {
 		id, err := putMsg(ctx, tx, "_",
 			fmt.Sprintf("test_%02d", i%parallel),
 			payload{ID: i + 1},
 			time.Second, false)
 		if err != nil {
-			return err
+			return "", err
 		}
-		select {
-		case <-ch:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+		return id, nil
+	}
+	get := func(ctx context.Context, tx *sql.Tx, i int, id string) error {
 		var p payload
-		errMsg, err := getMsg(ctx, tx, id, 1*time.Second, &p)
+		errMsg, err := getMsg(ctx, tx, id, 2*parallel*time.Second, &p)
 		if err != nil {
 			return err
 		}
 		if errMsg != "" {
 			t.Log(errMsg)
 		}
-		return tx.Commit()
+		return nil
 	}
 	qs := make([]string, 0, parallel)
 	for i := range parallel {
@@ -135,32 +116,37 @@ func testAQ(t testing.TB, resetTimer func(), loop func() bool) {
 	}
 	var i int
 	for loop() {
-		for range 4 {
-			grp, grpCtx := errgroup.WithContext(ctx)
-			grp.SetLimit(4)
-			for range parallel {
-				i++
-				i := i - 1
-				// t.Log("start", i)
-				grp.Go(func() error {
-					ctx, cancel := context.WithTimeout(grpCtx, 15*time.Second)
-					err := call(ctx, i)
-					cancel()
-					if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-						return nil
-					}
-					return err
-				})
-			}
-			// t.Log("i:", i)
-			if err := grp.Wait(); err != nil {
-				t.Error(err)
-				break
-			}
-			// t.Log("waited")
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
 		}
+		defer tx.Rollback()
+		type idI struct {
+			ID string
+			I  int
+		}
+		ids := make([]idI, 0, parallel)
+		for range parallel {
+			i++
+			i := i - 1
+			id, err := put(ctx, tx, i)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ids = append(ids, idI{ID: id, I: i})
+		}
+		logger.Warn("put", "n", len(ids))
+
+		for _, id := range ids {
+			logger.Info("wait", "id", id)
+			if err := get(ctx, tx, id.I, id.ID); err != nil {
+				t.Errorf("get %v: %+v", id, err)
+			}
+		}
+		logger.Warn("one done")
+		tx.Commit()
 	}
-	// t.Log("loop done")
+	t.Log("loop done")
 	ex.Close()
 	// t.Log("Close")
 }
@@ -212,14 +198,25 @@ func setupAQ(b testing.TB, consume func(ctx context.Context, w io.Writer, task a
 		if err := db.QueryRowContext(ctx, qry).Scan(&usr); err != nil {
 			b.Fatalf("%s: %+v", qry, err)
 		}
+		qrys := make([]string, 0, 2)
+		for _, pkg := range []string{"DBMS_AQ", "DBMS_AQADM"} {
+			qrys = append(qrys, "GRANT EXECUTE ON "+pkg+" TO "+usr)
+		}
 		db, err := sqlOpen(ctx, *flagSysConnect)
 		if err != nil {
 			b.Logf("WARN: connect to %q: %+v", *flagSysConnect, err)
+			cmd := exec.CommandContext(ctx, "sqlplus", *flagSysConnect)
+			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+			cmd.Stdin = strings.NewReader(
+				"SET ECHO ON TIMI ON\n" +
+					strings.Join(qrys, ";\n") +
+					";\nEXIT",
+			)
+			cmd.Run()
 		} else {
 			func() {
 				defer db.Close()
-				for _, pkg := range []string{"DBMS_AQ", "DBMS_AQADM"} {
-					qry := "GRANT EXECUTE ON " + pkg + " TO " + usr
+				for _, qry := range qrys {
 					if _, err = db.ExecContext(ctx, qry); err != nil {
 						b.Logf("WARN: %s: %+v", qry, err)
 					}
