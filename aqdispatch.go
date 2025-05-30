@@ -219,7 +219,7 @@ func New(
 		di.Close()
 		return nil, err
 	}
-	rOpts.Mode = godror.DeqPeek
+	rOpts.Mode = godror.DeqPeek // Remove without data
 	rOpts.Navigation = godror.NavFirst
 	rOpts.Visibility = godror.VisibleImmediate
 	rOpts.Wait = 0
@@ -443,6 +443,7 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 
 	var b []byte
 	var firstErr error
+	delMsgs := make([]godror.Message, 1)
 	one := func(ctx context.Context, msg *godror.Message) error {
 		var task Task
 		// The messages are tightly coupled with the queue,
@@ -492,6 +493,7 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 			case inCh <- task:
 				// Success
 			default:
+				// conf.Concurrency processing is all occupied, so save it for future processing
 				// diskQs are for traffic jams
 				b = MarshalProtobuf(b[:0], task)
 				conf.Info("enqueue", "task", task.Name, "deadline", task.Deadline) //task.GetDeadline().AsTime())
@@ -513,9 +515,8 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 			return err
 		}
 		conf.Debug("rm", "msgID", rOpts.MsgID)
-		msgs := make([]godror.Message, 1)
-		if n, err := di.rmQ.Dequeue(msgs); err != nil {
-			return err
+		if n, err := di.rmQ.Dequeue(delMsgs); err != nil {
+			return fmt.Errorf("rm Dequeue %v: %w", msg.MsgID, err)
 		} else if n == 0 {
 			conf.Warn("remove failed", "msgID", msg.MsgID)
 		}
