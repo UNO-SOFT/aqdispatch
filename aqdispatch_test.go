@@ -61,7 +61,7 @@ func BenchmarkAQ(b *testing.B) {
 type payload struct{ ID int }
 
 func testAQ(t testing.TB, resetTimer func(), loop func() bool) {
-	execTime := 1 * time.Second
+	execTime := 500 * time.Millisecond
 	ctx, closer, db, ex := setupAQ(t, func(ctx context.Context, w io.Writer, task aqdispatch.Task) (io.Reader, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -109,13 +109,22 @@ func testAQ(t testing.TB, resetTimer func(), loop func() bool) {
 		return id, nil
 	}
 	get := func(ctx context.Context, tx *sql.Tx, i int, id string) error {
-		timeout := 2 * parallel * execTime
+		timeout := 3 * execTime
 		if dl, ok := ctx.Deadline(); ok {
-			timeout = time.Until(dl)
+			timeout = time.Until(dl) * 9 / 10
 		}
-		var p payload
+		done := make(chan struct{})
+		go func() {
+			select {
+			case <-done:
+			case <-time.After(2 * execTime):
+				logger.Warn("SLOW getMsg", "msgID", id, "i", i)
+			}
+		}()
 		start := time.Now()
+		var p payload
 		errMsg, err := getMsg(ctx, tx, id, timeout, &p)
+		close(done)
 		dur := time.Since(start)
 		if errMsg != "" {
 			t.Log(errMsg)
@@ -157,7 +166,7 @@ func testAQ(t testing.TB, resetTimer func(), loop func() bool) {
 		for range 2 * parallel {
 			i++
 			i := i - 1
-			subCtx, subCancel := context.WithTimeout(ctx, 2*parallel*execTime)
+			subCtx, subCancel := context.WithTimeout(ctx, execTime)
 			id, err := put(subCtx, tx, i)
 			subCancel()
 			if err != nil {
@@ -169,7 +178,7 @@ func testAQ(t testing.TB, resetTimer func(), loop func() bool) {
 		logger.Warn("put", "n", len(ids))
 
 		for _, id := range ids {
-			subCtx, subCancel := context.WithTimeout(ctx, 2*parallel*execTime)
+			subCtx, subCancel := context.WithTimeout(ctx, 4*execTime)
 			err := get(subCtx, tx, id.I, id.ID)
 			subCancel()
 			if err != nil {
@@ -454,13 +463,14 @@ func getMsg(ctx context.Context, tx *sql.Tx, refID string, timeout time.Duration
       msgid              => v_msg_id
     );
     p_error_message := msg.errmsg;
-    IF v_msg_id IS NOT NULL THEN
-      BEGIN
-        p_payload := JSON_OBJECT_T.parse(msg.payload);
-      EXCEPTION WHEN json_decode_error THEN
-        RAISE;
-      END;
+    IF v_msg_id IS NULL OR msg.payload IS NULL THEN
+      RAISE no_messages;
     END IF;
+    BEGIN
+      p_payload := JSON_OBJECT_T.parse(msg.payload);
+    EXCEPTION WHEN json_decode_error THEN
+      RAISE;
+    END;
   --  RETURN(0);
   EXCEPTION WHEN no_messages THEN NULL;
     SELECT MIN(state) INTO v_state

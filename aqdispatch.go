@@ -675,9 +675,9 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 			go func() {
 				di.inProgress.Add(1)
 				defer func() { <-gate; di.inProgress.Done() }() //; taskPool.Release(task) }()
-				logger.Debug("execute")
+				logger.Debug("begin execute")
 				di.execute(ctx, task)
-				logger.Info("end", slog.Time("deadline", deadline),
+				logger.Info("executed", slog.Time("deadline", deadline),
 					slog.String("source", source))
 			}()
 		}
@@ -831,8 +831,6 @@ func (di *Dispatcher) execute(ctx context.Context, task Task) {
 		}
 	*/
 
-	logger.Debug("execute", "payload", string(task.Payload))
-
 	var res *bytes.Buffer
 	select {
 	case res = <-di.buffers:
@@ -859,7 +857,7 @@ func (di *Dispatcher) execute(ctx context.Context, task Task) {
 	}
 	start = time.Now()
 	err := di.answer(task.RefID, res.Bytes(), r, callErr)
-	logger.Info("pack", "length", res.Len(), "dur", time.Since(start).String(), "error", err)
+	logger.Info("answer", "length", res.Len(), "dur", time.Since(start).String(), "error", err)
 }
 
 // answer puts the answer into the queue.
