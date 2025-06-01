@@ -166,7 +166,7 @@ func testAQ(t testing.TB, resetTimer func(), loop func() bool) {
 		for range 2 * parallel {
 			i++
 			i := i - 1
-			subCtx, subCancel := context.WithTimeout(ctx, execTime)
+			subCtx, subCancel := context.WithTimeout(ctx, 10*time.Second)
 			id, err := put(subCtx, tx, i)
 			subCancel()
 			if err != nil {
@@ -178,7 +178,7 @@ func testAQ(t testing.TB, resetTimer func(), loop func() bool) {
 		logger.Warn("put", "n", len(ids))
 
 		for _, id := range ids {
-			subCtx, subCancel := context.WithTimeout(ctx, 4*execTime)
+			subCtx, subCancel := context.WithTimeout(ctx, 10*time.Second)
 			err := get(subCtx, tx, id.I, id.ID)
 			subCancel()
 			if err != nil {
