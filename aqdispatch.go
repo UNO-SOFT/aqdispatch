@@ -349,6 +349,7 @@ type Dispatcher struct {
 	deqMsgs                  []godror.Message
 	conf                     Config
 	mu                       sync.RWMutex
+	inProgress               sync.WaitGroup
 	getQHasBlob, putQHasBlob bool
 }
 
@@ -372,6 +373,7 @@ func (di *Dispatcher) Encode(s string) string {
 
 // Close the dispatcher.
 func (di *Dispatcher) Close() error {
+	di.inProgress.Wait()
 	di.mu.Lock()
 	defer di.mu.Unlock()
 	ins, putO, diskQs, getQ, rmQ, putQ := di.ins, di.putObjects, di.diskQs, di.getQ, di.rmQ, di.putQ
@@ -671,7 +673,8 @@ func (di *Dispatcher) consume(ctx context.Context, nm string, noDisQ bool) error
 		case gate <- struct{}{}:
 			// Execute on a separate goroutine
 			go func() {
-				defer func() { <-gate }() //; taskPool.Release(task) }()
+				di.inProgress.Add(1)
+				defer func() { <-gate; di.inProgress.Done() }() //; taskPool.Release(task) }()
 				logger.Debug("execute")
 				di.execute(ctx, task)
 				logger.Info("end", slog.Time("deadline", deadline),
@@ -839,9 +842,9 @@ func (di *Dispatcher) execute(ctx context.Context, task Task) {
 		res = &x
 	}
 	defer func() {
+		res.Reset()
 		select {
 		case di.buffers <- res:
-			res.Reset()
 		default:
 		}
 	}()
@@ -862,9 +865,6 @@ func (di *Dispatcher) execute(ctx context.Context, task Task) {
 // answer puts the answer into the queue.
 func (di *Dispatcher) answer(refID string, payload []byte, blob io.Reader, err error) error {
 	di.conf.Debug("answer", "refID", refID, "payload", payload, "error", err)
-	if di.putQ == nil {
-		return nil
-	}
 	var errMsg string
 	if err != nil {
 		if errors.Is(err, ErrSkipResponse) {
@@ -906,6 +906,18 @@ Loop:
 			return err
 		}
 	}
+	defer func() {
+		if err = obj.ResetAttributes(); err != nil {
+			obj.Close()
+			return
+		}
+		select {
+		case di.putObjects <- obj:
+		default:
+			obj.Close()
+		}
+	}()
+
 	if errMsg != "" {
 		if err = obj.Set(di.conf.ResponseKeyErrMsg, errMsg); err != nil {
 			obj.Close()
@@ -951,12 +963,6 @@ Loop:
 	}
 	if err = di.putQ.Enqueue([]godror.Message{msg}); err != nil {
 		return err
-	}
-	select {
-	case di.putObjects <- obj:
-		_ = obj.ResetAttributes()
-	default:
-		_ = obj.Close()
 	}
 	return nil
 }

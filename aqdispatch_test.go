@@ -12,8 +12,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +26,11 @@ import (
 	"github.com/UNO-SOFT/zlog/v2"
 
 	"github.com/godror/godror"
+)
+
+const (
+	parallel                                  = 64
+	aqTableName, aqQueueName, aqQueueTypeName = "T_WSC_Q", "Q_WSC", "TY_WSC"
 )
 
 var (
@@ -40,7 +47,7 @@ var (
 func TestAQ(t *testing.T) {
 	var i int
 	testAQ(t, nil, func() bool {
-		if i >= 10 {
+		if i >= 18 {
 			return false
 		}
 		i++
@@ -54,7 +61,11 @@ func BenchmarkAQ(b *testing.B) {
 type payload struct{ ID int }
 
 func testAQ(t testing.TB, resetTimer func(), loop func() bool) {
+	execTime := 1 * time.Second
 	ctx, closer, db, ex := setupAQ(t, func(ctx context.Context, w io.Writer, task aqdispatch.Task) (io.Reader, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if len(task.Payload) == 0 {
 			t.Errorf("got empty Task=%#v", task)
 		}
@@ -70,14 +81,22 @@ func testAQ(t testing.TB, resetTimer func(), loop func() bool) {
 			t.Errorf("zero ID in Task=%#v (%q)", task, string(task.Payload))
 			return nil, fmt.Errorf("zero ID (%q)", string(task.Payload))
 		}
-		time.Sleep(time.Second) // Simulate a 1s execution time
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(execTime): // Simulate a 1s execution time
+		}
 		answer := payload{ID: p.Payload.ID*2 + 1}
-		return nil, json.NewEncoder(w).Encode(answer)
+		// t.Logf("process %d", p.Payload.ID)
+		err := json.NewEncoder(w).Encode(answer)
+		if err != nil {
+			t.Errorf("encode %+v: %+v", answer, err)
+		}
+		t.Logf("answer=%+v", answer)
+		return nil, err
 	})
 	defer closer()
 	logger := zlog.SFromContext(ctx)
-
-	const parallel = 64
 
 	put := func(ctx context.Context, tx *sql.Tx, i int) (string, error) {
 		id, err := putMsg(ctx, tx, "_",
@@ -90,13 +109,20 @@ func testAQ(t testing.TB, resetTimer func(), loop func() bool) {
 		return id, nil
 	}
 	get := func(ctx context.Context, tx *sql.Tx, i int, id string) error {
-		var p payload
-		errMsg, err := getMsg(ctx, tx, id, 2*parallel*time.Second, &p)
-		if err != nil {
-			return err
+		timeout := 2 * parallel * execTime
+		if dl, ok := ctx.Deadline(); ok {
+			timeout = time.Until(dl)
 		}
+		var p payload
+		start := time.Now()
+		errMsg, err := getMsg(ctx, tx, id, timeout, &p)
+		dur := time.Since(start)
 		if errMsg != "" {
 			t.Log(errMsg)
+		}
+		if err != nil {
+			t.Errorf("getMsg(%s): %+v [%s]", id, err, dur)
+			return err
 		}
 		return nil
 	}
@@ -104,8 +130,10 @@ func testAQ(t testing.TB, resetTimer func(), loop func() bool) {
 	for i := range parallel {
 		qs = append(qs, fmt.Sprintf("test_%02d", i))
 	}
+	exCtx, exCancel := context.WithCancel(ctx)
+	defer exCancel()
 	go func() {
-		err := ex.Run(ctx, qs)
+		err := ex.Run(exCtx, qs)
 		if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
 			t.Log(err)
 		}
@@ -126,21 +154,26 @@ func testAQ(t testing.TB, resetTimer func(), loop func() bool) {
 			I  int
 		}
 		ids := make([]idI, 0, parallel)
-		for range parallel {
+		for range 2 * parallel {
 			i++
 			i := i - 1
-			id, err := put(ctx, tx, i)
+			subCtx, subCancel := context.WithTimeout(ctx, 2*parallel*execTime)
+			id, err := put(subCtx, tx, i)
+			subCancel()
 			if err != nil {
 				t.Fatal(err)
 			}
+			// logger.Info("put", "id", id, "i", i)
 			ids = append(ids, idI{ID: id, I: i})
 		}
 		logger.Warn("put", "n", len(ids))
 
 		for _, id := range ids {
-			logger.Info("wait", "id", id)
-			if err := get(ctx, tx, id.I, id.ID); err != nil {
-				t.Errorf("get %v: %+v", id, err)
+			subCtx, subCancel := context.WithTimeout(ctx, 2*parallel*execTime)
+			err := get(subCtx, tx, id.I, id.ID)
+			subCancel()
+			if err != nil {
+				t.Fatalf("get %v: %+v", id, err)
 			}
 		}
 		logger.Warn("one done")
@@ -150,8 +183,6 @@ func testAQ(t testing.TB, resetTimer func(), loop func() bool) {
 	ex.Close()
 	// t.Log("Close")
 }
-
-const aqTableName, aqQueueName, aqQueueTypeName = "T_WSC_Q", "Q_WSC", "TY_WSC"
 
 func setupAQ(b testing.TB, consume func(ctx context.Context, w io.Writer, task aqdispatch.Task) (io.Reader, error)) (context.Context, func() error, *sql.DB, *aqdispatch.Dispatcher) {
 	{
@@ -277,16 +308,19 @@ END;`
 			b.Fatalf("%s: %+v", qry, err)
 		}
 	}
-	aqLog := logger.WithGroup("aqdispatch")
-	if !testing.Verbose() {
-		aqLog = nil
+	var aqLog *slog.Logger
+	if testing.Verbose() {
+		aqLog = logger.WithGroup("aqdispatch")
+		if dbg, _ := strconv.ParseBool(os.Getenv("DEBUG")); !dbg {
+			aqLog = slog.New(zlog.NewLevelHandler(slog.LevelInfo, aqLog.Handler()))
+		}
 	}
 	ex, err := aqdispatch.New(db,
 		aqdispatch.Config{
-			Enc: encoding.Nop, QueueCount: 1, Concurrency: 3,
+			Enc: encoding.Nop, QueueCount: parallel, Concurrency: 1,
 			DisQPath: tempDir, DisQPrefix: "aqdispatch-test-",
 			DisQMaxMsgSize: 16 << 20, DisQMaxFileSize: 16 << 20,
-			Timeout:     10 * time.Second,
+			Timeout:     60 * time.Second,
 			PipeTimeout: 10 * time.Second,
 			Logger:      aqLog,
 		},
@@ -399,7 +433,8 @@ func getMsg(ctx context.Context, tx *sql.Tx, refID string, timeout time.Duration
     message_properties dbms_aq.message_properties_t;
     msg TY_wsc_resp;
     v_msg_id RAW(16);
-    c_timeout CONSTANT SIMPLE_INTEGER := 10;
+    c_timeout CONSTANT SIMPLE_INTEGER := NVL(p_timeout, DBMS_AQ.FOREVER);
+    v_state PLS_INTEGER;
 
     json_decode_error EXCEPTION;
     PRAGMA EXCEPTION_INIT(json_decode_error, -40587 );
@@ -416,9 +451,10 @@ func getMsg(ctx context.Context, tx *sql.Tx, refID string, timeout time.Duration
       dequeue_options    => dequeue_options,
       message_properties => message_properties,
       payload            => msg,
-      msgid              => v_msg_id);
+      msgid              => v_msg_id
+    );
     p_error_message := msg.errmsg;
-    IF msg.payload IS NOT NULL AND DBMS_LOB.getlength(msg.payload) > 0 THEN
+    IF v_msg_id IS NOT NULL THEN
       BEGIN
         p_payload := JSON_OBJECT_T.parse(msg.payload);
       EXCEPTION WHEN json_decode_error THEN
@@ -427,6 +463,10 @@ func getMsg(ctx context.Context, tx *sql.Tx, refID string, timeout time.Duration
     END IF;
   --  RETURN(0);
   EXCEPTION WHEN no_messages THEN NULL;
+    SELECT MIN(state) INTO v_state
+      FROM ` + aqTableName + `_RESP
+      WHERE msgid = v_msg_id;
+    :errMsg := 'STATE='||v_state;
   --  RETURN(-1);
   END;
 BEGIN
@@ -449,7 +489,7 @@ END;`
 		return "", fmt.Errorf("%s: %w", qry, err)
 	}
 	if payload == "" {
-		return errMsg, errNotFound
+		return errMsg, fmt.Errorf("%s: %w", errMsg, errNotFound)
 	}
 	var err error
 	if err = json.Unmarshal([]byte(payload), dest); err != nil {
