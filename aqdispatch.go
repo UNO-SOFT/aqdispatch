@@ -166,96 +166,63 @@ func New(
 	}
 
 	ctx := context.Background()
-	getCx, err := db.Conn(dbCtx(ctx, "aqdispatch", inQName))
+
+	getQ, err := newConnQueue(ctx, db, inQName, inQType, nil, func(opts *godror.DeqOptions) {
+		opts.Mode = godror.DeqBrowse
+		opts.Navigation = godror.NavFirst
+		opts.Visibility = godror.VisibleImmediate
+		opts.Wait = conf.PipeTimeout
+		opts.Correlation = conf.Correlation
+	})
 	if err != nil {
 		di.Close()
 		return nil, err
 	}
-	di.getCx = getCx
+	// The remove queue is only required because we have to dequeue with different DeqOptions,
+	// but on the same queue and on the same connection.
+	rmQ, err := newConnQueue(ctx, db, inQName, inQType, nil, func(opts *godror.DeqOptions) {
+		opts.Mode = godror.DeqPeek // Remove without data
+		opts.Navigation = godror.NavFirst
+		opts.Visibility = godror.VisibleImmediate
+		opts.Wait = 0
+		opts.Correlation = conf.Correlation
+	})
+	if err != nil {
+		di.Close()
+		return nil, err
+	}
+	di.rmQ = rmQ
 
-	if err = godror.Raw(ctx, getCx, func(conn godror.Conn) error {
+	if err = godror.Raw(ctx, getQ.Cx, func(conn godror.Conn) error {
 		di.Timezone = conn.Timezone()
 		return nil
 	}); err != nil {
 		di.Close()
 		return nil, err
 	}
-	if di.getQ, err = godror.NewQueue(ctx, getCx, inQName, inQType); err != nil {
-		di.Close()
-		return nil, err
-	}
+	di.getQ = getQ
 	di.conf.Info("getQ", "name", di.getQ.Name())
 	if err = di.getQ.PurgeExpired(ctx); err != nil {
 		di.conf.Warn("PurgeExpired", "queue", di.getQ.Name(), "error", err)
 	}
-	dOpts, err := di.getQ.DeqOptions()
-	if err != nil {
-		di.Close()
-		return nil, err
-	}
-	dOpts.Mode = godror.DeqBrowse
-	dOpts.Navigation = godror.NavFirst
-	dOpts.Visibility = godror.VisibleImmediate
-	dOpts.Wait = conf.PipeTimeout
-	dOpts.Correlation = conf.Correlation
-	if err = di.getQ.SetDeqOptions(dOpts); err != nil {
-		di.Close()
-		return nil, err
-	}
-	_, di.getQHasBlob = di.getQ.PayloadObjectType.Attributes[di.conf.RequestKeyBlob]
-
-	if di.rmQ, err = godror.NewQueue(ctx, getCx, inQName, inQType); err != nil {
-		di.Close()
-		return nil, err
-	}
-	di.conf.Info("rmQ", "name", di.rmQ.Name())
-	rOpts, err := di.rmQ.DeqOptions()
-	if err != nil {
-		di.Close()
-		return nil, err
-	}
-	rOpts.Mode = godror.DeqPeek // Remove without data
-	rOpts.Navigation = godror.NavFirst
-	rOpts.Visibility = godror.VisibleImmediate
-	rOpts.Wait = 0
-	di.rOpts = rOpts
+	_, di.getQHasBlob = di.getQ.PayloadObjectType().Attributes[di.conf.RequestKeyBlob]
 
 	if outQName == "" {
 		return &di, nil
 	}
-
 	di.putObjects = make(chan *godror.Object, conf.Concurrency)
-	putCx, err := db.Conn(dbCtx(ctx, "aqdispatch", outQName))
-	if err != nil {
+
+	if di.putQ, err = newConnQueue(ctx, db, outQName, outQType, func(opts *godror.EnqOptions) {
+		opts.Visibility = godror.VisibleImmediate
+	}, nil); err != nil {
 		di.Close()
 		return nil, err
 	}
-	di.putCx = putCx
-	if di.putConn, err = godror.DriverConn(ctx, putCx); err != nil {
-		di.Close()
-		return nil, err
-	}
-	putQ, err := godror.NewQueue(ctx, putCx, outQName, outQType)
-	if err != nil {
-		di.Close()
-		return nil, err
-	}
-	di.putQ = putQ
 	di.conf.Info("putQ", "name", di.putQ.Name())
 	if err = di.putQ.PurgeExpired(ctx); err != nil {
 		di.conf.Warn("PurgeExpired", "queue", di.putQ.Name(), "error", err)
 	}
-	eOpts, err := di.putQ.EnqOptions()
-	if err != nil {
-		di.Close()
-		return nil, err
-	}
-	eOpts.Visibility = godror.VisibleImmediate
-	if err = di.putQ.SetEnqOptions(eOpts); err != nil {
-		di.Close()
-		return nil, err
-	}
-	_, di.putQHasBlob = putQ.PayloadObjectType.Attributes[di.conf.ResponseKeyBlob]
+	_, di.putQHasBlob = di.putQ.PayloadObjectType().Attributes[di.conf.ResponseKeyBlob]
 	return &di, nil
 }
 
@@ -263,10 +230,10 @@ func New(
 // purging expired messages.
 func (di *Dispatcher) PurgeExpired(ctx context.Context) error {
 	var firstErr error
-	if di.getQ != nil {
+	if !di.getQ.IsZero() {
 		firstErr = di.getQ.PurgeExpired(ctx)
 	}
-	if di.putQ != nil {
+	if !di.putQ.IsZero() {
 		if err := di.putQ.PurgeExpired(ctx); err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -353,10 +320,8 @@ type Dispatcher struct {
 	getCx, putCx             io.Closer
 	putConn                  godror.Conn
 	putObjects               chan *godror.Object
-	getQ, rmQ                *godror.Queue
-	rOpts                    godror.DeqOptions
+	getQ, putQ, rmQ          *connQueue
 	ins                      map[string]chanGateQ
-	putQ                     *godror.Queue
 	datas                    chan *godror.Data
 	do                       DoFunc
 	buffers                  chan *bytes.Buffer
@@ -427,8 +392,10 @@ func (di *Dispatcher) Close() error {
 	di.inProgress.Wait()
 	di.mu.Lock()
 	defer di.mu.Unlock()
-	ins, putO, getQ, rmQ, putQ := di.ins, di.putObjects, di.getQ, di.rmQ, di.putQ
-	di.ins, di.putObjects, di.getQ, di.rmQ, di.putQ = nil, nil, nil, nil, nil
+	ins, putO := di.ins, di.putObjects
+	di.ins, di.putObjects = nil, nil
+	getQ, putQ, rmQ := di.getQ, di.putQ, di.rmQ
+	di.getQ, di.putQ, di.rmQ = nil, nil, nil
 	di.putConn = nil
 	for _, c := range ins {
 		if c.ch != nil {
@@ -446,23 +413,16 @@ func (di *Dispatcher) Close() error {
 			}
 		}
 	}
-	getCx, putCx := di.getCx, di.putCx
-	di.getCx, di.putCx = nil, nil
-	if putCx != nil {
-		putCx.Close()
-	}
-	if getCx != nil {
-		getCx.Close()
-	}
 	if getQ != nil {
 		getQ.Close()
-	}
-	if rmQ != nil {
-		rmQ.Close()
 	}
 	if putQ != nil {
 		putQ.Close()
 	}
+	if rmQ != nil {
+		rmQ.Close()
+	}
+
 	return nil
 }
 
@@ -490,6 +450,12 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 	di.mu.RLock()
 	msgs, conf := di.deqMsgs[:], di.conf
 	di.mu.RUnlock()
+
+	rOpts, err := di.rmQ.DeqOptions()
+	if err != nil {
+		return err
+	}
+
 	n, deqErr := di.getQ.Dequeue(msgs)
 	conf.Debug("dequeue", "n", n, "error", deqErr)
 	msgs = msgs[:n]
@@ -548,7 +514,6 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 		}
 
 		// remove successfully processed message from queue
-		rOpts := di.rOpts
 		rOpts.MsgID = append(rOpts.MsgID[:0], msg.MsgID[:]...)
 		if err := di.rmQ.SetDeqOptions(rOpts); err != nil {
 			return err
@@ -853,7 +818,7 @@ func (di *Dispatcher) execute(ctx context.Context, task Task) {
 	start := time.Now()
 	r, callErr := di.do(ctx, res, task)
 	logger.Info("call", "dur", time.Since(start).String(), "error", callErr)
-	if errors.Is(callErr, ErrExit) || di.putQ == nil {
+	if errors.Is(callErr, ErrExit) || di.putQ.IsZero() {
 		return
 	}
 	start = time.Now()
@@ -901,7 +866,7 @@ Loop:
 	}
 	if obj == nil {
 		di.conf.Debug("create", "object", di.putQ.PayloadObjectType)
-		if obj, err = di.putQ.PayloadObjectType.NewObject(); err != nil {
+		if obj, err = di.putQ.PayloadObjectType().NewObject(); err != nil {
 			return err
 		}
 	}
@@ -968,4 +933,109 @@ Loop:
 
 func dbCtx(ctx context.Context, module, action string) context.Context {
 	return godror.ContextWithTraceTag(ctx, godror.TraceTag{Module: module, Action: action})
+}
+
+type connQueue struct {
+	q    *godror.Queue
+	Cx   *sql.Conn
+	init func() error
+}
+
+func newConnQueue(ctx context.Context, db *sql.DB, qName, qType string,
+	mkEnqOpts func(*godror.EnqOptions), mkDeqOpts func(*godror.DeqOptions),
+) (*connQueue, error) {
+	var cq connQueue
+
+	cq.init = func() error {
+		cq.Close()
+		if err := func() error {
+			var err error
+			if cq.Cx, err = db.Conn(dbCtx(ctx, "aqdispatch", qName)); err != nil {
+				return err
+			}
+			if cq.q, err = godror.NewQueue(ctx, cq.Cx, qName, qType); err != nil {
+				return err
+			}
+
+			if mkEnqOpts != nil {
+				opts, err := cq.q.EnqOptions()
+				if err != nil {
+					return err
+				}
+				mkEnqOpts(&opts)
+				if err = cq.q.SetEnqOptions(opts); err != nil {
+					return err
+				}
+			}
+
+			if mkDeqOpts != nil {
+				opts, err := cq.q.DeqOptions()
+				if err != nil {
+					return err
+				}
+				mkDeqOpts(&opts)
+				if err = cq.q.SetDeqOptions(opts); err != nil {
+					return err
+				}
+			}
+			return nil
+		}(); err != nil {
+			cq.Close()
+			return err
+		}
+		return nil
+	}
+
+	if err := cq.init(); err != nil {
+		return nil, err
+	}
+	return &cq, nil
+}
+
+func (cq *connQueue) Close() error {
+	if cq == nil {
+		return nil
+	}
+	if cq.q != nil {
+		cq.q.Close()
+	}
+	if cq.Cx != nil {
+		cq.Cx.Close()
+	}
+	cq.q, cq.Cx = nil, nil
+	return nil
+}
+func (cq *connQueue) withRetry(f func() error) error {
+	err := f()
+	if err == nil {
+		return nil
+	}
+	if !godror.IsBadConn(err) {
+		return err
+	}
+	if err := cq.init(); err != nil {
+		return err
+	}
+	return f()
+}
+func (cq *connQueue) IsZero() bool { return cq == nil || cq.Cx == nil }
+func (cq *connQueue) Name() string { return cq.q.Name() }
+
+func (cq *connQueue) DeqOptions() (opts godror.DeqOptions, err error) {
+	err = cq.withRetry(func() error { opts, err = cq.q.DeqOptions(); return err })
+	return opts, err
+}
+func (cq *connQueue) SetDeqOptions(opts godror.DeqOptions) error {
+	return cq.withRetry(func() error { return cq.q.SetDeqOptions(opts) })
+}
+func (cq *connQueue) PayloadObjectType() *godror.ObjectType { return cq.q.PayloadObjectType }
+func (cq *connQueue) PurgeExpired(ctx context.Context) error {
+	return cq.withRetry(func() error { return cq.q.PurgeExpired(ctx) })
+}
+func (cq *connQueue) Enqueue(msgs []godror.Message) error {
+	return cq.withRetry(func() error { return cq.q.Enqueue(msgs) })
+}
+func (cq *connQueue) Dequeue(msgs []godror.Message) (n int, err error) {
+	err = cq.withRetry(func() error { n, err = cq.q.Dequeue(msgs); return err })
+	return n, err
 }

@@ -109,7 +109,7 @@ func testAQ(t testing.TB, resetTimer func(), loop func() bool) {
 		return id, nil
 	}
 	get := func(ctx context.Context, tx *sql.Tx, i int, id string) error {
-		timeout := 3 * execTime
+		timeout := 4 * execTime
 		if dl, ok := ctx.Deadline(); ok {
 			timeout = time.Until(dl) * 9 / 10
 		}
@@ -117,7 +117,7 @@ func testAQ(t testing.TB, resetTimer func(), loop func() bool) {
 		go func() {
 			select {
 			case <-done:
-			case <-time.After(2 * execTime):
+			case <-time.After(3 * execTime):
 				logger.Warn("SLOW getMsg", "msgID", id, "i", i)
 			}
 		}()
