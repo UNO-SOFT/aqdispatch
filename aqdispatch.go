@@ -317,7 +317,6 @@ func (di *Dispatcher) Run(ctx context.Context) error {
 // If Concurrency allows, calls the do function given in New,
 // and sends the answer as PAYLOAD of what that writes as response.
 type Dispatcher struct {
-	getCx, putCx             io.Closer
 	putConn                  godror.Conn
 	putObjects               chan *godror.Object
 	getQ, putQ, rmQ          *connQueue
@@ -579,42 +578,45 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 //
 // When nm is the empty string, that's a catch-all (not catched by others).
 func (di *Dispatcher) consume(ctx context.Context, in chanGateQ) error {
-	one := func() error {
-		var qCh <-chan []byte
-		if in.q != nil {
-			qCh = in.q.ReadChan()
-		}
+	var qCh <-chan []byte
+	if in.q != nil {
+		qCh = in.q.ReadChan()
+	}
+	one := func() (Task, *slog.Logger, error) {
 		var task Task
 		var ok bool
 		var source string
+		logger := di.conf.Logger
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return task, logger, ctx.Err()
 		case task, ok = <-in.ch:
 			if !ok {
-				return fmt.Errorf("%q: %w", in.name, errChannelClosed)
+				return task, logger, fmt.Errorf("%q: %w", in.name, errChannelClosed)
 			}
-			source = "inCh[" + in.name + "]"
-			// fast path
+			source = "in"
 		case b, ok := <-qCh:
 			if !ok {
-				return nil
+				return task, logger, nil
 			}
 			if err := task.UnmarshalProtobuf(b); err != nil {
 				di.conf.Error("unmarshal", "bytes", b, "error", err)
-				return errContinue
+				return task, logger, errContinue
 			}
-			source = "qCh[" + in.name + "]"
+			source = "q"
 		}
-		di.conf.Info("consume", "task", task, "source", source)
+		logger = logger.With(
+			slog.String("source", source+"Ch["+in.name+"]"))
+		di.conf.Info("consume", "task", task)
 		if task.IsZero() {
-			return errContinue
+			return task, logger, errContinue
 		}
-
-		logger := di.conf.With(slog.String("name", task.Name), slog.String("refID", task.RefID))
+		logger = di.conf.With(
+			slog.String("name", task.Name),
+			slog.String("refID", task.RefID))
 		if task.Name == "" {
-			logger.Info("empty task", "task", task, "source", source)
-			return errContinue
+			logger.Info("empty task", "task", task)
+			return task, logger, errContinue
 		}
 		deadline := task.Deadline
 		if deadline.IsZero() {
@@ -623,35 +625,42 @@ func (di *Dispatcher) consume(ctx context.Context, in chanGateQ) error {
 		if !deadline.After(time.Now()) {
 			logger.Info("skip overtime", slog.Time("deadline", deadline), slog.String("refID", task.RefID))
 			if task.RefID != "" {
-				_ = di.answer(task.RefID, nil, nil, context.DeadlineExceeded)
+				go di.answer(task.RefID, nil, nil, context.DeadlineExceeded)
 			}
-			// taskPool.Release(task)
-			return nil
+			return task, logger, errContinue
 		}
 
-		logger.Info("begin", slog.Time("deadline", deadline),
+		logger = logger.With(slog.Time("deadline", deadline))
+		logger.Info("begin",
 			slog.Int("payloadLen", len(task.Payload)),
 			slog.Int("blobsCount", len(task.Blobs)))
+		return task, logger, nil
+	}
+	oneGated := func() error {
 		select {
 		case <-ctx.Done():
-			di.conf.Warn("context done", "error", ctx.Err())
 			return ctx.Err()
 		case in.gate <- struct{}{}:
+			task, logger, err := one()
+			if err != nil || task.IsZero() {
+				<-in.gate
+				return err
+			}
+
+			di.inProgress.Add(1)
 			// Execute on a separate goroutine
 			go func() {
-				di.inProgress.Add(1)
-				defer func() { <-in.gate; di.inProgress.Done() }() //; taskPool.Release(task) }()
+				defer func() { di.inProgress.Done(); <-in.gate }()
 				logger.Debug("begin execute")
 				di.execute(ctx, task)
-				logger.Info("executed", slog.Time("deadline", deadline),
-					slog.String("source", source))
+				logger.Info("executed")
 			}()
+			return nil
 		}
-		return nil
 	}
 
 	for {
-		if err := one(); err == nil ||
+		if err := oneGated(); err == nil ||
 			errors.Is(err, context.DeadlineExceeded) ||
 			errors.Is(err, errContinue) {
 			continue

@@ -135,10 +135,10 @@ func testAQ(t testing.TB, resetTimer func(), loop func() bool) {
 		}
 		return nil
 	}
-	qs := make([]string, 0, parallel)
-	for i := range parallel {
-		qs = append(qs, fmt.Sprintf("test_%02d", i))
-	}
+	// qs := make([]string, 0, parallel)
+	// for i := range parallel {
+	// 	qs = append(qs, fmt.Sprintf("test_%02d", i))
+	// }
 	exCtx, exCancel := context.WithCancel(ctx)
 	defer exCancel()
 	go func() {
@@ -326,7 +326,7 @@ END;`
 	}
 	ex, err := aqdispatch.New(db,
 		aqdispatch.Config{
-			Enc: encoding.Nop, Concurrency: 1,
+			Enc: encoding.Nop, Concurrency: 2,
 			DisQPath: tempDir, DisQPrefix: "aqdispatch-test-",
 			DisQMaxMsgSize: 16 << 20, DisQMaxFileSize: 16 << 20,
 			Timeout:     60 * time.Second,
