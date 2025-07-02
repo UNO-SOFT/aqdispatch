@@ -7,7 +7,7 @@ toolchain go1.24.1
 require (
 	github.com/UNO-SOFT/zlog v0.8.1
 	github.com/VictoriaMetrics/easyproto v0.1.4
-	github.com/godror/godror v0.48.3
+	github.com/godror/godror v0.49.0
 	github.com/google/go-cmp v0.6.0
 	github.com/nsqio/go-diskqueue v1.1.0
 	golang.org/x/sync v0.14.0
