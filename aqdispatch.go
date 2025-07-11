@@ -203,7 +203,12 @@ func New(
 	di.getQ = getQ
 	di.conf.Info("getQ", "name", di.getQ.Name())
 	if err = di.getQ.PurgeExpired(ctx); err != nil {
-		di.conf.Warn("PurgeExpired", "queue", di.getQ.Name(), "error", err)
+		lvl := slog.LevelWarn
+		var ec interface{ Code() int }
+		if errors.As(err, &ec) && ec.Code() == 6550 {
+			lvl = slog.LevelInfo
+		}
+		di.conf.Log(ctx, lvl, "PurgeExpired", "queue", di.getQ.Name(), "error", err)
 	}
 	_, di.getQHasBlob = di.getQ.PayloadObjectType().Attributes[di.conf.RequestKeyBlob]
 
