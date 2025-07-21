@@ -519,11 +519,8 @@ func (di *Dispatcher) batch(ctx context.Context) error {
 
 		// remove successfully processed message from queue
 		rOpts.MsgID = append(rOpts.MsgID[:0], msg.MsgID[:]...)
-		if err := di.rmQ.SetDeqOptions(rOpts); err != nil {
-			return err
-		}
 		conf.Debug("rm", "msgID", rOpts.MsgID)
-		if n, err := di.rmQ.Dequeue(delMsgs); err != nil {
+		if n, err := di.rmQ.DequeueWithOptions(delMsgs, &rOpts); err != nil {
 			return fmt.Errorf("rm Dequeue %v: %w", msg.MsgID, err)
 		} else if n == 0 {
 			conf.Warn("remove failed", "msgID", msg.MsgID)
@@ -1049,7 +1046,14 @@ func (cq *connQueue) PurgeExpired(ctx context.Context) error {
 func (cq *connQueue) Enqueue(msgs []godror.Message) error {
 	return cq.withRetry(func() error { return cq.q.Enqueue(msgs) })
 }
+func (cq *connQueue) EnqueueWithOptions(msgs []godror.Message, opts *godror.EnqOptions) error {
+	return cq.withRetry(func() error { return cq.q.EnqueueWithOptions(msgs, opts) })
+}
 func (cq *connQueue) Dequeue(msgs []godror.Message) (n int, err error) {
 	err = cq.withRetry(func() error { n, err = cq.q.Dequeue(msgs); return err })
+	return n, err
+}
+func (cq *connQueue) DequeueWithOptions(msgs []godror.Message, opts *godror.DeqOptions) (n int, err error) {
+	err = cq.withRetry(func() error { n, err = cq.q.DequeueWithOptions(msgs, opts); return err })
 	return n, err
 }
