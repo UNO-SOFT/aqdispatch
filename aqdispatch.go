@@ -828,7 +828,11 @@ func (di *Dispatcher) execute(ctx context.Context, task Task) {
 	}
 	start := time.Now()
 	r, callErr := di.do(ctx, res, task)
-	logger.Info("call", "dur", time.Since(start).String(), "error", callErr)
+	if callErr != nil {
+		logger.Error("call", "dur", time.Since(start).String(), "error", callErr)
+	} else {
+		logger.Info("call", "dur", time.Since(start).String())
+	}
 	if errors.Is(callErr, ErrExit) || di.putQ.IsZero() {
 		return
 	}
