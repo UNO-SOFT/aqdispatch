@@ -434,7 +434,7 @@ func getMsg(ctx context.Context, tx *sql.Tx, refID string, timeout time.Duration
   v_ref_id CONSTANT VARCHAR2(32) := :refID;
   v_timeout CONSTANT PLS_INTEGER := :timeout;
   v_payload JSON_OBJECT_T;
-  
+
   PROCEDURE aq_resp_get(p_ref_id IN VARCHAR2,
                         p_error_message OUT NOCOPY VARCHAR2, p_payload OUT NOCOPY JSON_OBJECT_T,
                         p_timeout IN PLS_INTEGER) IS
@@ -538,4 +538,30 @@ func sqlOpen(ctx context.Context, dsn string) (*sql.DB, error) {
 	}
 	db.SetMaxOpenConns(4)
 	return db, nil
+}
+
+func TestErrLen(t *testing.T) {
+	const maxLen = 1000
+	f := func(err error) string {
+		errMsg := err.Error()
+		if len(errMsg) > maxLen {
+			const partLen = maxLen/2 - 2
+			errMsg = errMsg[:partLen] + " .. " + errMsg[len(errMsg)-partLen:]
+		}
+		t.Log(errMsg)
+		return errMsg
+	}
+
+	want := strconv.Itoa(maxLen)
+	s := f(fmt.Errorf("%s", strings.Repeat(want, maxLen/len(want))))
+	if len(s) != maxLen {
+		t.Errorf("%s: wanted %s, got %d", want, want, len(s))
+	}
+
+	s = f(fmt.Errorf("BEGIN[%s]END", strings.Repeat(want, maxLen/len(want)+1)))
+	if len(s) != maxLen {
+		t.Errorf("%d: wanted %d, got %d", maxLen+1, maxLen, len(s))
+	} else if !strings.Contains(s, " .. ") {
+		t.Errorf("%d: wanted .., not found in %s", maxLen+1, s)
+	}
 }

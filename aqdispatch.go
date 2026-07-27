@@ -1,4 +1,4 @@
-// Copyright 2021, 2025 Tamás Gulácsi. All rights reserved.
+// Copyright 2021, 2026 Tamás Gulácsi. All rights reserved.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -850,8 +850,10 @@ func (di *Dispatcher) answer(refID string, payload []byte, blob io.Reader, err e
 			return nil
 		}
 		errMsg = err.Error()
-		if len(errMsg) > 1000 {
-			errMsg = errMsg[:1000]
+		const maxLen = 1000
+		if len(errMsg) > maxLen {
+			const partLen = maxLen/2 - 2
+			errMsg = errMsg[:partLen] + " .. " + errMsg[len(errMsg)-partLen:]
 		}
 	}
 	logger := di.conf.Logger.With("refID", refID)
