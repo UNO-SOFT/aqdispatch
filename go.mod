@@ -5,7 +5,7 @@ go 1.27
 require (
 	github.com/UNO-SOFT/zlog v0.8.1
 	github.com/VictoriaMetrics/easyproto v1.2.0
-	github.com/godror/godror v0.51.6
+	github.com/godror/godror v0.52.0
 	github.com/google/go-cmp v0.7.0
 	github.com/nsqio/go-diskqueue v1.1.0
 	golang.org/x/sync v0.14.0

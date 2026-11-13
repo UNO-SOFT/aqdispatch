@@ -20,6 +20,8 @@ github.com/godror/godror v0.49.1-0.20250721062633-a5243387eef9 h1:CgseqEBGVb4vem
 github.com/godror/godror v0.49.1-0.20250721062633-a5243387eef9/go.mod h1:kTMcxZzRw73RT5kn9v3JkBK4kHI6dqowHotqV72ebU8=
 github.com/godror/godror v0.51.6 h1:kl1nKiaaCJ108OqGNr2pmEkzdkEnOkY7FnDOflNITQQ=
 github.com/godror/godror v0.51.6/go.mod h1:cJC60zusesc1J1wnOTvYfkBr53UFKekY4MY8j2of2uc=
+github.com/godror/godror v0.52.0 h1:e5sERjZCZdp+nw8xgpMdOzSgAa98UcDVGz6G+hzX/Xo=
+github.com/godror/godror v0.52.0/go.mod h1:cJC60zusesc1J1wnOTvYfkBr53UFKekY4MY8j2of2uc=
 github.com/godror/knownpb v0.3.0 h1:+caUdy8hTtl7X05aPl3tdL540TvCcaQA6woZQroLZMw=
 github.com/godror/knownpb v0.3.0/go.mod h1:PpTyfJwiOEAzQl7NtVCM8kdPCnp3uhxsZYIzZ5PV4zU=
 github.com/google/go-cmp v0.6.0 h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI=
